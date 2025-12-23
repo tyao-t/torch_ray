@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from foundation.operators.fundamental_ops import silu, gelu
+from foundation.operators.fundamental_ops import swish, gelu
 
 class Qwen23FeedForward(nn.Module):
     def __init__(self, cfg):
@@ -10,7 +10,7 @@ class Qwen23FeedForward(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         candidate, gate_input = self.up_proj(x).chunk(2, dim=-1)
-        gate = silu(gate_input)
+        gate = swish(gate_input)
         gated = candidate * gate
         return self.down_proj(gated)
     
@@ -36,7 +36,7 @@ class Qwen23FeedForward(nn.Module):
 
 #     def forward(self, x):
 #         candidate = self.w_up(x)
-#         gate = silu(self.w_gate(x))
+#         gate = swish(self.w_gate(x))
 #         gated = gate * candidate
 #         return self.w_down(gated)
     

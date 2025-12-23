@@ -12,14 +12,17 @@ def softmax(x, **kwargs):
 def sigmoid(x):
     return 1 / (1 + torch.exp(-x))
 
-def silu(x, beta=torch.tensor(1)):
-    return x * sigmoid(beta*x)
+def silu(x):
+    return x * sigmoid(x)
 
-def silu(x, beta=torch.tensor(1)):
+def silu(x):
+    return x / (1 + torch.exp(-x))
+
+def silu(x):
+    return F.silu(x)
+
+def swish(x, beta=torch.tensor(1)):
     return x / (1 + torch.exp(-beta*x))
-
-def silu(x, beta=torch.tensor(1)):
-    return F.silu(beta*x)
 
 def gelu_exact(x):
     return 0.5 * x * (1 + torch.erf(x / torch.sqrt(2)))
