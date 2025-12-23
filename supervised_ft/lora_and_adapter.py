@@ -7,6 +7,7 @@ class LoRALayer(torch.nn.Module):
         super().__init__()
         self.A = torch.nn.Parameter(torch.empty(in_dim, rank))
         torch.nn.init.kaiming_uniform_(self.A, a=torch.sqrt(5)) # similar to standard weight initialization
+        # torch.nn.init.uniform_(A, -1.0 / torch.sqrt(in_dim), 1.0 / torch.sqrt(in_dim))
         self.B = torch.nn.Parameter(torch.zeros(rank, out_dim))
         self.alpha = alpha
 
