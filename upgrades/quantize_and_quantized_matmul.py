@@ -1,30 +1,40 @@
 # "affine" quantize
+import torch
 import numpy as np
+from numpy.typing import NDArray
 
 def quantize_affine_no_group(x, bits=4):
-    x = np.asarray(x, dtype=np.float32)
+    if not isinstance(x, torch.Tensor):
+        x = torch.tensor(x, dtype=torch.float32)
+    else:
+        x = x.float()
+
     qmax = (1 << bits) - 1
 
-    alpha = float(x.max())
-    beta  = float(x.min())
+    alpha = x.max()
+    beta  = x.min()
 
-    ## fall back case: all values are the same
     if alpha == beta:
         scale = 0.0
-        bias = beta
-        q = np.zeros_like(x, dtype=np.uint8)
+        bias = beta.item()
+        q = torch.zeros_like(x, dtype=torch.uint8)
         return q, scale, bias
 
     scale = (alpha - beta) / qmax
     bias = beta
 
-    q = np.rint((x - bias) / scale)          # round
-    q = np.clip(q, 0, qmax).astype(np.uint8) # clamp to [0, qmax]
-    return q, scale, bias
+    q = torch.round((x - bias) / scale) # round 
+    q = torch.clamp(q, 0, qmax).to(torch.uint8) # clamp to [0, qmax]
+    
+    return q, scale.item(), bias.item()
 
 def dequantize_affine_no_group(q, scale, bias):
-    q = np.asarray(q, dtype=np.float32)
-    return q * float(scale) + float(bias)
+    if not isinstance(q, torch.Tensor):
+        q = torch.tensor(q, dtype=torch.float32)
+    else:
+        q = q.float()
+
+    return q * scale + bias
 
 # MLX 的 q（也就是 w_q）不是逐元素数组，
 # 而是 packed 的 bitstream（通常是 uint32），dequantize 必须知道每个元素占多少 bit 才能把它解出来。
@@ -32,10 +42,72 @@ def dequantize_affine_no_group(q, scale, bias):
 # q会被打包进uint32 N/8 ceil[N * bits/32]个uint32
 # biases和scales可能是stream所以还是要知道group_size
 
-import numpy as np
+# def quantize_affine_2d_grouped(w, group_size=64, bits=4):
+#     w = np.asarray(w, dtype=np.float32)
+#     K, N = w.shape
+#     if N % group_size != 0:
+#         raise ValueError(f"N={N} must be divisible by group_size={group_size}")
+
+#     qmax = (1 << bits) - 1
+#     G = N // group_size
+
+#     q = np.empty((K, N), dtype=np.uint8)
+#     scales = np.empty((K, G), dtype=np.float32)
+#     biases = np.empty((K, G), dtype=np.float32)
+
+#     for k in range(K):
+#         row = w[k]
+#         for g in range(G):
+#             start = g * group_size
+#             end = start + group_size
+#             block = row[start:end]
+
+#             alpha = float(block.max())
+#             beta  = float(block.min())   # bias = min
+
+#             if alpha == beta:
+#                 scale = 0.0
+#                 qq = np.zeros((group_size,), dtype=np.uint8)
+#             else:
+#                 scale = (alpha - beta) / qmax
+#                 qq = np.rint((block - beta) / scale)
+#                 qq = np.clip(qq, 0, qmax).astype(np.uint8)
+
+#             scales[k, g] = scale
+#             biases[k, g] = beta
+#             q[k, start:end] = qq
+
+#     return q, scales, biases
+
+# def dequantize_affine_2d_grouped(q, scales, biases, group_size=64):
+#     q = np.asarray(q, dtype=np.float32)
+#     scales = np.asarray(scales, dtype=np.float32)
+#     biases = np.asarray(biases, dtype=np.float32)
+
+#     K, N = q.shape
+#     if N % group_size != 0:
+#         raise ValueError(f"N={N} must be divisible by group_size={group_size}")
+
+#     num_groups = N // group_size
+#     if scales.shape != (K, num_groups) or biases.shape != (K, num_groups):
+#         raise ValueError(f"scales/biases must have shape {(K, num_groups)}, got {scales.shape} / {biases.shape}")
+
+#     w_hat = np.empty((K, N), dtype=np.float32)
+
+#     for k in range(K):
+#         for g in range(num_groups):
+#             start = g * group_size
+#             end = start + group_size
+#             w_hat[k, start:end] = q[k, start:end] * scales[k, g] + biases[k, g]
+
+#     return w_hat
 
 def quantize_affine_2d_grouped(w, group_size=64, bits=4):
-    w = np.asarray(w, dtype=np.float32)
+    if not isinstance(w, torch.Tensor):
+        w = torch.tensor(w, dtype=torch.float32)
+    else:
+        w = w.float()
+        
     K, N = w.shape
     if N % group_size != 0:
         raise ValueError(f"N={N} must be divisible by group_size={group_size}")
@@ -43,59 +115,180 @@ def quantize_affine_2d_grouped(w, group_size=64, bits=4):
     qmax = (1 << bits) - 1
     G = N // group_size
 
-    q = np.empty((K, N), dtype=np.uint8)
-    scales = np.empty((K, G), dtype=np.float32)
-    biases = np.empty((K, G), dtype=np.float32)
+    w_view = w.view(K, G, group_size)
 
-    for k in range(K):
-        row = w[k]
-        for g in range(G):
-            start = g * group_size
-            end = start + group_size
-            block = row[start:end]
+    alpha = w_view.amax(dim=-1, keepdim=True) # (K, G, 1)
+    beta  = w_view.amin(dim=-1, keepdim=True) # (K, G, 1)
+    
+    raw_scale = (alpha - beta) / qmax # (K, G, 1)
+    
+    scale_safe = torch.where(raw_scale == 0, torch.ones_like(raw_scale), raw_scale)
 
-            alpha = float(block.max())
-            beta  = float(block.min())   # bias = min
+    q = torch.round((w_view - beta) / scale_safe)
+    q = torch.clamp(q, 0, qmax).to(torch.uint8)
 
-            if alpha == beta:
-                scale = 0.0
-                qq = np.zeros((group_size,), dtype=np.uint8)
-            else:
-                scale = (alpha - beta) / qmax
-                qq = np.rint((block - beta) / scale)
-                qq = np.clip(qq, 0, qmax).astype(np.uint8)
-
-            scales[k, g] = scale
-            biases[k, g] = beta
-            q[k, start:end] = qq
+    q = q.view(K, N)
+    scales = raw_scale.squeeze(-1)
+    biases = beta.squeeze(-1)
 
     return q, scales, biases
 
-
 def dequantize_affine_2d_grouped(q, scales, biases, group_size=64):
-    q = np.asarray(q, dtype=np.float32)
-    scales = np.asarray(scales, dtype=np.float32)
-    biases = np.asarray(biases, dtype=np.float32)
+    if not isinstance(q, torch.Tensor):
+        q = torch.tensor(q, dtype=torch.float32)
+    else:
+        q = q.float()
+
+    if not isinstance(scales, torch.Tensor):
+        scales = torch.tensor(scales, dtype=torch.float32, device=q.device)
+    
+    if not isinstance(biases, torch.Tensor):
+        biases = torch.tensor(biases, dtype=torch.float32, device=q.device)
 
     K, N = q.shape
-    if N % group_size != 0:
-        raise ValueError(f"N={N} must be divisible by group_size={group_size}")
+    G = N // group_size
 
-    num_groups = N // group_size
-    if scales.shape != (K, num_groups) or biases.shape != (K, num_groups):
-        raise ValueError(f"scales/biases must have shape {(K, num_groups)}, got {scales.shape} / {biases.shape}")
+    q_view = q.view(K, G, group_size)
+    scales_view = scales.view(K, G, 1)
+    biases_view = biases.view(K, G, 1)
 
-    w_hat = np.empty((K, N), dtype=np.float32)
+    w = q_view * scales_view + biases_view
 
-    for k in range(K):
-        for g in range(num_groups):
-            start = g * group_size
-            end = start + group_size
-            w_hat[k, start:end] = q[k, start:end] * scales[k, g] + biases[k, g]
+    return w.view(K, N)
 
-    return w_hat
+def quantized_matmul_unpacked_torch(
+    scales: torch.Tensor,
+    biases: torch.Tensor,
+    group_size: int,
+    bits: int,
+    a: torch.Tensor,
+    q: torch.Tensor,
+) -> torch.Tensor:
+    assert a.dim() == 2 and q.dim() == 2
+    M, N = a.shape
+    K, Nq = q.shape
+    assert Nq == N
+    assert N % group_size == 0
+    G = N // group_size
+    assert scales.shape == (K, G) and biases.shape == (K, G)
 
-from numpy.typing import NDArray
+    a = a.float()
+    q = q.to(dtype=torch.int32)
+    scales = scales.float()
+    biases = biases.float()
+
+    out = torch.zeros((M, K), dtype=torch.float32, device=a.device)
+
+    for i in range(K):
+        for j in range(0, N, group_size):
+            g = j // group_size
+            
+            q_chunk = q[i, j:j+group_size]
+
+            scale = scales[i, g]
+            bias = biases[i, g]
+            w_chunk = q_chunk.float() * scale + bias
+            
+            a_chunk = a[:, j:j+group_size]
+
+            out[:, i] += a_chunk @ w_chunk
+
+    return out
+
+def quantized_matmul_elementwise_torch(
+    scales: torch.Tensor,
+    biases: torch.Tensor,
+    group_size: int,
+    bits: int,
+    a: torch.Tensor,
+    q: torch.Tensor,
+) -> torch.Tensor:
+    M, N = a.shape
+    K, _ = q.shape
+    
+    a = a.float()
+    q = q.float() 
+    scales = scales.float()
+    biases = biases.float()
+    
+    out = torch.zeros((M, K), dtype=torch.float32, device=a.device)
+    
+    for i in range(K):
+        for j in range(N):
+            g = j // group_size
+            
+            scale = scales[i, g]
+            bias = biases[i, g]
+            
+            w_val = q[i, j] * scale + bias
+            
+            out[:, i] += a[:, j] * w_val
+            
+    return out
+
+def quantized_matmul_elementwise_torch(
+    scales: torch.Tensor,
+    biases: torch.Tensor,
+    group_size: int,
+    bits: int,
+    a: torch.Tensor,
+    q: torch.Tensor,
+) -> torch.Tensor:
+    M, N = a.shape
+    K, _ = q.shape
+    
+    G = scales.shape[1]
+
+    a = a.float()
+    q = q.float() 
+    scales = scales.float()
+    biases = biases.float()
+    
+    out = torch.zeros((M, K), dtype=torch.float32, device=a.device)
+    
+    for i in range(K):
+        for g in range(G):
+            scale = scales[i, g]
+            bias = biases[i, g]
+            g_index = g*group_size
+            for j in range(group_size):
+                col_idx = g_index+j         
+                w_val = q[i, col_idx] * scale + bias
+                out[:, i] += a[:, col_idx] * w_val
+            
+    return out
+
+def quantized_matmul_elementwise_numpy(
+    scales: NDArray[np.floating],
+    biases: NDArray[np.floating],
+    group_size: int,
+    bits: int,
+    a: NDArray[np.floating],
+    q: NDArray[np.integer],
+) -> NDArray[np.floating]:
+    
+    M, N = a.shape
+    K, _ = q.shape
+    
+    a_f32 = a.astype(np.float32, copy=False)
+    scales_f32 = scales.astype(np.float32, copy=False)
+    biases_f32 = biases.astype(np.float32, copy=False)
+    
+    out = np.zeros((M, K), dtype=np.float32)
+    
+    for i in range(K):
+        for j in range(N):
+            g = j // group_size
+            
+            scale = scales_f32[i, g]
+            bias = biases_f32[i, g]
+            
+            w_val = float(q[i, j]) * scale + bias
+            
+            out[:, i] += a_f32[:, j] * w_val
+
+    return out
+
 def quantized_matmul_unpacked(
     scales: NDArray[np.floating],
     biases: NDArray[np.floating],
@@ -104,13 +297,11 @@ def quantized_matmul_unpacked(
     a: NDArray[np.floating],
     q: NDArray[np.integer],
 ) -> NDArray[np.floating]:
-    """
-      a:      (M, N) float32
-      q:      (K, N) int4 or int8 codes unpacked, each in [0, 2^bits - 1]
-      scales: (K, G) float32, where G = N / group_size
-      biases: (K, G) float32, where G = N / group_size
-      out:    (M, K) float32 (same dtype as a)
-    """
+    # a:      (M, N) float32
+    # q:      (K, N) int4 or int8 codes unpacked, each in [0, 2^bits - 1]
+    # scales: (K, G) float32, where G = N / group_size
+    # biases: (K, G) float32, where G = N / group_size
+    # out:    (M, K) float32 (same dtype as a)
     assert a.ndim == 2 and q.ndim == 2
     assert scales.ndim == 2 and biases.ndim == 2
 
@@ -150,94 +341,3 @@ def quantized_matmul_unpacked(
             out[:, i] += a_f32[:, j:j+group_size] @ w_chunk # (M,)
 
     return out.astype(a.dtype, copy=False)
-
-# static inline void check(bool cond, const std::string& msg) {
-#     if (!cond) throw std::runtime_error(msg);
-# }
-
-# /**
-#  * Quantized matmul (unpacked codes).
-#  *
-#  * a:      (M, N) float
-#  * q:      (K, N) uint8 (or int8/uint8 codes), each in [0, 2^bits - 1]
-#  * scales: (K, G) float, where G = N / group_size
-#  * biases: (K, G) float, where G = N / group_size
-#  *
-#  * Returns:
-#  *   out: (M, K) float
-#  *
-#  * Memory layout: row-major contiguous.
-#  * Indexing:
-#  *   a[m*N + n]
-#  *   q[k*N + n]
-#  *   scales[k*G + g]
-#  *   biases[k*G + g]
-#  *   out[m*K + k]
-#  */
-# std::vector<float> quantized_matmul_unpacked_cpp(
-#     const float* a,                 // size M*N
-#     const std::uint8_t* q,          // size K*N
-#     const float* scales,            // size K*G
-#     const float* biases,            // size K*G
-#     int M, int N, int K,
-#     int group_size,
-#     int bits
-# ) {
-#     check(M > 0 && N > 0 && K > 0, "M,N,K must be positive");
-#     check(group_size > 0, "group_size must be positive");
-#     check(bits >= 1 && bits <= 16, "bits must be in [1,16]");
-#     check(N % group_size == 0, "N must be divisible by group_size");
-
-#     const int G = N / group_size;
-#     const int qmax = (1 << bits) - 1;
-
-#     // Optional: validate q range (O(K*N), can be removed for speed)
-#     {
-#         std::uint8_t qmin = 255, qmax_seen = 0;
-#         for (int i = 0; i < K * N; ++i) {
-#             qmin = std::min(qmin, q[i]);
-#             qmax_seen = std::max(qmax_seen, q[i]);
-#         }
-#         check(qmin >= 0, "q contains negative? (uint8 shouldn't)");
-#         check(qmax_seen <= qmax, "q contains values > (2^bits - 1)");
-#     }
-
-#     // out: (M, K)
-#     std::vector<float> out((size_t)M * K, 0.0f);
-
-#     // temp buffer for one group's dequantized weights: length group_size
-#     std::vector<float> w_chunk((size_t)group_size);
-
-#     // Loop order matches your Python structure:
-#     // for i in range(K):
-#     //   for j in range(0, N, group_size):
-#     //     g = j/group_size
-#     //     w_chunk[t] = q[i, j+t]*scale + bias
-#     //     out[:, i] += A_block @ w_chunk
-#     for (int i = 0; i < K; ++i) {
-#         for (int g = 0; g < G; ++g) {
-#             const int j0 = g * group_size;
-#             const float scale = scales[i * G + g];
-#             const float bias  = biases[i * G + g];
-
-#             // dequantize this group's weights for row i
-#             const std::uint8_t* q_row = q + (size_t)i * N + j0;
-#             for (int t = 0; t < group_size; ++t) {
-#                 w_chunk[t] = (float)q_row[t] * scale + bias;
-#             }
-
-#             // out[m, i] += dot(a[m, j0:j0+gs], w_chunk)
-#             for (int m = 0; m < M; ++m) {
-#                 const float* a_row = a + (size_t)m * N + j0;
-#                 float sum = 0.0f;
-#                 // dot product of length group_size
-#                 for (int t = 0; t < group_size; ++t) {
-#                     sum += a_row[t] * w_chunk[t];
-#                 }
-#                 out[(size_t)m * K + i] += sum;
-#             }
-#         }
-#     }
-
-#     return out;
-# }
