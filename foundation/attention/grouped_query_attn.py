@@ -19,7 +19,7 @@ def scaled_dot_product_attention(queries, keys, values, *, scale=None, attn_mask
         assert num_groups == values.shape[-3]
         group_size = num_heads // num_groups
         if num_groups > 1:
-            keys = keys.repeat_interleave(group_size, -3) # repeat also works, but why repeat_interleave https://gemini.google.com/share/a408f2390abd
+            keys = keys.repeat_interleave(group_size, -3) # repeat also works (and has DRAM burst, memory coalescing), but why repeat_interleave  https://gemini.google.com/share/a408f2390abd
             values = values.repeat_interleave(group_size, -3) 
     else:
         assert num_groups == 1 or num_heads == num_groups # Might also be Multi-Query Attention

@@ -56,7 +56,7 @@ class MultiHeadAttention(nn.Module):
 
         return context_vec # There would also be a resid dropout here normally
 
-class MultiHeadAttention(nn.Module):
+class MHASeq2SeqCompatible(nn.Module):
     def __init__(self, d_in, d_out_qk, d_out_v, context_length, dropout, num_heads, bias=False):
         super().__init__()
         assert d_out_qk % num_heads == 0 and d_out_v % num_heads == 0
@@ -108,7 +108,7 @@ class MultiHeadAttention(nn.Module):
 
         return context_vec # Plus resid dropout
 
-class MHAOptimizedSDPSeq2SeqCompatible(nn.Module):
+class MultiHeadAttentionOptimizedSDPA(nn.Module):
     def __init__(self, d_in, d_out, num_heads, dropout=0, qkv_bias=False):
         super().__init__()
 

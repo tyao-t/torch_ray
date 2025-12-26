@@ -1,4 +1,5 @@
 from nsw import NSW, select_neighbors
+from typing import Callable, List, Tuple
 import torch
 import math
 import random
@@ -20,9 +21,9 @@ class HNSWIndex:
         self.max_edges_0 = max_edges ** 2
         self.level_normalization = 1.0 / math.log(max_edges)
         
-        self.vertices: list[torch.Tensor] = []
-        self.rids: list[int] = []
-        self.layers: list[NSW] = [NSW(self.vertices, distance_fn, self.max_edges_0)]
+        self.vertices: List[torch.Tensor] = []
+        self.rids: List[int] = []
+        self.layers: List[NSW] = [NSW(self.vertices, distance_fn, self.max_edges_0)]
         self.nsw_only = nsw_only,
         self.generator = random.Random()
 
@@ -32,12 +33,12 @@ class HNSWIndex:
         self.rids.append(rid)
         return vertex_id
 
-    def build_index(self, initial_data: list[tuple[torch.Tensor, int]]):
+    def build_index(self, initial_data: List[Tuple[torch.Tensor, int]]):
         random.shuffle(initial_data)
         for vec, rid in initial_data:
             self.insert(vec, rid)
 
-    def search(self, vec: torch.Tensor, limit: int) -> list[int]:
+    def search(self, vec: torch.Tensor, limit: int) -> List[int]:
         if self.nsw_only:
             nearest_elements = self.layers[0].search_layer(vec, limit, [self.layers[0].default_entry_point()])
             return [self.rids[vid] for vid in nearest_elements]

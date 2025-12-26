@@ -62,7 +62,6 @@ class MultiHeadLatentAttentionNaive(nn.Module):
 
         return context_vec
 
-# https://gemini.google.com/share/a889739af239
 class DeepSeekV3LatentAttention(nn.Module):
     def __init__(self, cfg, d_in, d_out, num_heads, 
                  rope_dim=64, latent_dim=512, dropout=0.0, qkv_bias=False):
