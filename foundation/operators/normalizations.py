@@ -23,7 +23,7 @@ class RMSNorm(nn.Module):
     def __init__(self, emb_dim, *, eps=1e-6, qwen_compliant=True, bias=False):
         super().__init__()
         self.eps = eps
-        self.qwen3_compatible = qwen_compliant
+        self.qwen_compliant = qwen_compliant
         self.scale = nn.Parameter(torch.ones(emb_dim))
         self.shift = nn.Parameter(torch.zeros(emb_dim)) if bias else None
 

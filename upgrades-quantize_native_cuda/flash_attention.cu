@@ -740,7 +740,7 @@ void mat_mul_main() {
 #include <stdio.h>
 #include <cuda_runtime.h>
 
-__global__ void reduce(int *in, int *out, int n) {
+__global__ void all_sum_reduce(int *in, int *out, int n) {
     extern __shared__ int sdata[];
     unsigned int tid = threadIdx.x;
     
@@ -774,7 +774,7 @@ int main() {
     while (threads < n) threads *= 2;
     int size = n * sizeof(int);
 
-    reduce<<<1, threads, threads*sizeof(int)>>>(d_in, d_out, n);
+    all_sum_reduce<<<1, threads, threads*sizeof(int)>>>(d_in, d_out, n);
 
     cudaMemcpy(&h_out, d_out, sizeof(int), cudaMemcpyDeviceToHost);
 
@@ -873,7 +873,7 @@ __device__ void prefix_scan_koggle_stone(int n, int *array, int *prefix_sum)
     if (idx < n) prefix_sum[idx] = arr[threadIdx.x];
 }
 
-__global__ void prefix_scan_brent_kang_native(int n, int *array, int *prefix_sum)
+__global__ void prefix_scan_brent_kung_native(int n, int *array, int *prefix_sum)
 {
     __shared__ int arr[BLOCK_DIM];
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -899,7 +899,7 @@ __global__ void prefix_scan_brent_kang_native(int n, int *array, int *prefix_sum
     if (idx < n) prefix_sum[idx] = arr[threadIdx.x];
 }
 
-__global__ void prefix_scan_brent_kang_optimzed_for_ctrl_divergence(int n, int *array, int *prefix_sum)
+__global__ void prefix_scan_brent_kung_optimzed_for_ctrl_divergence(int n, int *array, int *prefix_sum)
 {
     __shared__ int arr[BLOCK_DIM];
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -927,7 +927,7 @@ __global__ void prefix_scan_brent_kang_optimzed_for_ctrl_divergence(int n, int *
 }
 
 /*
-__global__ void prefix_scan_brent_kang_optimzed_for_ctrl_divergence(int n, int *array, int *prefix_sum)
+__global__ void prefix_scan_brent_kung_optimzed_for_ctrl_divergence(int n, int *array, int *prefix_sum)
 {
     __shared__ int arr[2*BLOCK_DIM];
     int idx = 2 * blockIdx.x * blockDim.x + threadIdx.x;

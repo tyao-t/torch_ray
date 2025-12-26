@@ -7,7 +7,7 @@
 
 import torch.nn.functional as F
 import torch
-from text_and_data.dpo_preference_dataset import PreferenceDatasetDPO, custom_collate_fn_dpo, eos_token_id
+from text_and_data.preference_dpo_dataset import PreferenceDatasetDPO, custom_collate_fn_dpo, eos_token_id
 from torch.utils.data import DataLoader
 from inference.generate import generate_text_stream_concat_flex
 from transformers import AutoTokenizer

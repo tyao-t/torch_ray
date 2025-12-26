@@ -64,8 +64,6 @@ def grpo_collate_fn(batch):
     assert len(batch) == 1, "Use batch_size=1 so one batch == one GRPO group."
     return batch[0]
 
-
-# Example
 if __name__ == "__main__":
     from transformers import AutoTokenizer
 

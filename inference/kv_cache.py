@@ -14,6 +14,7 @@ class KvCache(ABC):
     ) -> tuple[torch.Tensor, torch.Tensor, int, Optional[torch.Tensor]]:
         # returns keys, values, offset, mask
         pass
+
 class FullKvCache(KvCache): 
     def __init__(self):
         self.keys = None
@@ -69,6 +70,7 @@ class BatchingKvCache(KvCache):
     def __init__(self, max_active_requests: int):
         self.max_active_requests = max_active_requests
         self.kv_caches = [None] * max_active_requests
+        # Optimize Batching KV Cache: Paged Attention: https://chatgpt.com/share/693ef34f-adec-8003-87f4-c5e5d5a2c591
 
     def update_and_fetch(
         self,
@@ -132,8 +134,6 @@ class BatchingKvCache(KvCache):
             raise ValueError(f"Request id {id} is not in the cache")
         self.kv_caches[id] = None
 
-# Optimize Batching KV Cache: Paged Attention 
-# https://chatgpt.com/share/693ef34f-adec-8003-87f4-c5e5d5a2c591
 class RotatingKvCache(KvCache):
     def __init__(self, capacity):
         self.offset = 0
