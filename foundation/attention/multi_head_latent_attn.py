@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from attention import causal_mask
+from foundation.attention.multi_head_attn import causal_mask
 from foundation.operators.rotary_pos_embeddings import compute_positional_params, apply_rotary_embedding
 from foundation.operators.normalizations import RMSNorm
 from inference.kv_cache import MLAKVCache
@@ -42,20 +42,20 @@ class MultiHeadLatentAttentionNaive(nn.Module):
         # values_all = self.W_UV(latent_total)   # (batch, L_k_total, d_out)
         keys_all, values_all = torch.chunk(self.W_UKV(latent_total), chunks=2, dim=-1)
 
-        queries = queries_all.view(B, num_new_tokens, num_heads, head_dim).transpose(-1, -2)
-        keys = keys_all.view(B, keys.shape[1], num_heads, head_dim).transpose(-1, -2)
-        values = values_all.view(B, values.shape[1], num_heads, head_dim).transpose(-1, -2)
+        queries = queries_all.view(B, num_new_tokens, num_heads, head_dim).transpose(-2, -3)
+        keys = keys_all.view(B, keys.shape[1], num_heads, head_dim).transpose(-2, -3)
+        values = values_all.view(B, values.shape[1], num_heads, head_dim).transpose(-2, -3)
 
-        attn_scores = queries @ keys.transpose(-2, -1)
+        attn_scores = queries @ keys.transpose(-1, -2)
 
         mask_bool = causal_mask(num_new_tokens, keys.shape[-2], device=queries.device)
 
         attn_scores.masked_fill_(mask_bool, -torch.inf)
 
-        attn_weights = torch.softmax(attn_scores / keys.shape[-1]**0.5, dim=-1)
+        attn_weights = torch.softmax(attn_scores * torch.rsqrt(keys.shape[-1]), dim=-1)
         attn_weights = self.dropout(attn_weights)
 
-        context_vec = (attn_weights @ values).transpose(1, 2)
+        context_vec = (attn_weights @ values).transpose(-2, -3)
 
         context_vec = context_vec.contiguous().view(B, num_new_tokens, self.d_out)
         context_vec = self.out_proj(context_vec)
@@ -153,10 +153,8 @@ class DeepSeekV3LatentAttention(nn.Module):
         # B. RoPE Score (Standard Query @ RoPE Cache)
         score_rope = q_rope @ k_rope_history.transpose(-1, -2)
         
-        # Combine
-        scores = (score_content + score_rope) * ((self.head_dim + self.rope_dim) ** -0.5)
+        scores = (score_content + score_rope) * torch.rsqrt(self.head_dim + self.rope_dim)
         
-        # Mask & Softmax
         total_len = c_kv_history.shape[-2]
         scores.masked_fill_(causal_mask(num_new_tokens, total_len, device=x.device), -torch.inf)
         attn_weights = torch.softmax(scores, dim=-1) # self.dropout(torch.softmax(scores, dim=-1))

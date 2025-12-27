@@ -89,7 +89,7 @@ class MHASeq2SeqCompatible(nn.Module):
         assert num_tokens_k == num_tokens_v, "num_tokens_k and num_tokens_v must match"
 
         queries = self.W_query(x_q).view(batch_size, num_tokens_q, self.num_heads, self.head_dim_qk).transpose(-2, -3)
-        keys    = self.W_key(x_k).view(batch_size, num_tokens_k, self.num_heads, self.head_dim_qk).transpose(-2, -3)
+        keys = self.W_key(x_k).view(batch_size, num_tokens_k, self.num_heads, self.head_dim_qk).transpose(-2, -3)
         values  = self.W_value(x_v).view(batch_size, num_tokens_v, self.num_heads, self.head_dim_v).transpose(-2, -3)
 
         attn_scores = queries @ keys.transpose(-1, -2)  # (b, num_heads, num_tokens_q, num_tokens_k)
@@ -141,6 +141,6 @@ class MultiHeadAttentionOptimizedSDPA(nn.Module):
                 queries, keys, values, dropout_p=self.dropout if self.training else 0)
         context_vec = attn(is_causal=True) if mask == "causal" else attn(attn_mask=mask)
  
-        context_vec = context_vec.transpose(1, 2).contiguous().view(batch_size, num_tokens, self.d_out)
+        context_vec = context_vec.transpose(-2, -3).contiguous().view(batch_size, num_tokens, self.d_out)
 
         return self.resid_dropout(self.out_proj(context_vec))

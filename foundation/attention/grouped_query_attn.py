@@ -9,10 +9,11 @@ from foundation.attention.multi_head_attn import causal_mask
 from inference.kv_cache import KvCache
 
 def scaled_dot_product_attention(queries, keys, values, *, scale=None, attn_mask=None, dropout_p=0, \
-                                 enable_gqa=False, **kwargs):
+                                 enable_gqa=False, is_causal=False, **kwargs):
+    assert attn_mask is None or (not is_causal), "Invalid when both attn_mask and is_causal are set"
     *leading_dims_q, num_heads, query_len, query_head_dim = queries.shape
     *leading_dims_k, num_groups, keys_len, keys_head_dim = keys.shape
-    assert leading_dims_q != leading_dims_k
+    assert leading_dims_q == leading_dims_k
 
     if enable_gqa:
         assert num_heads % num_groups == 0
@@ -23,15 +24,18 @@ def scaled_dot_product_attention(queries, keys, values, *, scale=None, attn_mask
             values = values.repeat_interleave(group_size, -3) 
     else:
         assert num_groups == 1 or num_heads == num_groups # Might also be Multi-Query Attention
+        # if num_groups == 1:
+        #     keys = keys.expand(*leading_dims_k, num_heads, keys_len, keys_head_dim)
+        #     values = values.expand(*leading_dims_k, num_heads, keys_len, keys_head_dim)
 
     factor = torch.rsqrt(query_head_dim) if scale is None else scale
     assert query_head_dim == keys_head_dim
     attn_scores = queries @ keys.transpose(-2, -1) * factor
 
-    mask = causal_mask(query_len, keys_len, device=queries.device) if mask == "causal" else mask
+    mask = causal_mask(query_len, keys_len, device=queries.device) if is_causal else attn_mask
     neg_inf = -torch.inf # torch.finfo(attn_scores.dtype).min # 
-    if attn_mask is not None:
-        attn_scores.masked_fill(attn_mask, neg_inf)
+    if mask is not None:
+        attn_scores.masked_fill_(mask, neg_inf)
     attn_weights = softmax(attn_scores, dim=-1)
     attn_weights = F.dropout(dropout_p) # Attn dropout
     assert keys_len == values.shape[-2]
@@ -128,7 +132,8 @@ class GroupedQueryAttention(nn.Module):
                 queries.contiguous(),
                 keys.contiguous(),
                 values.contiguous(),
-                attn_mask=mask,
+                attn_mask=mask if mask != "causal" else None,
+                is_causal=mask == "causal",
                 dropout_p=dropout_p,
                 enable_gqa=True
             )
