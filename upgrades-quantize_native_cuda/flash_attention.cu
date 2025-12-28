@@ -12,88 +12,84 @@
 #include <cuda.h>
 #include <cuda_runtime.h>
 #include <math.h>
+#include <stdio.h>
+#include <stdlib.h>
 
 __global__ void flash_attention_kernel_v2(
     const float* Q, const float* K, const float* V,
-    const int L, const int d,
-    const int Tc, const int Tr,
+    const int L, const int D,
+    const int numTiles, const int tileSize,
     const float softmax_scale,
     float* O
 ) {
     int tx = threadIdx.x;
     int bx = blockIdx.x; int by = blockIdx.y;
 
-    int qkv_base_offset = (by * gridDim.x * L * d) + (bx * L * d);
+    int qkv_base_offset = (by * gridDim.x * L * D) + (bx * L * D);
 
     extern __shared__ float sram[];
-    int tile_size = WARP_SIZE * d;
+    int tile_size_m_d = tileSize * D;
 
     float* Qi = sram;
-    float* Kj = &sram[tile_size];
-    float* Vj = &sram[tile_size * 2];
-    float* S  = &sram[tile_size * 3];
+    float* Kj = &sram[tile_size_m_d];
+    float* Vj = &sram[tile_size_m_d * 2];
+    float* S  = &sram[tile_size_m_d * 3];
 
-    for (int i = 0; i < Tr; i++) {
-        for (int x = 0; x < d; x++) {
-            Qi[(tx * d) + x] = Q[qkv_base_offset + (tile_size * i) + (tx * d) + x];
+    for (int i = 0; i < numTiles; i++) {
+        for (int d = 0; d < D; d++) {
+            Qi[(tx * D) + d] = Q[qkv_base_offset + (tile_size_m_d * i) + (tx * D) + d];
         }
 
-        float m_curr = -INFINITY;
-        float l_curr = 0.0f;
+        float m_cur = -INFINITY;
+        float l_cur = 0.0f;
 
-        for (int x = 0; x < d; x++) {
-            O[qkv_base_offset + (tile_size * i) + (tx * d) + x] = 0.0f;
-        }
+        // for (int d = 0; d < D; d++) {
+        //     O[qkv_base_offset + (tile_size_m_d * i) + (tx * D) + d] = 0.0f;
+        // }
+        // __syncthreads();
 
-        __syncthreads();
-
-        for (int j = 0; j < Tc; j++) {
-            for (int x = 0; x < d; x++) {
-                Kj[(tx * d) + x] = K[qkv_base_offset + (tile_size * j) + (tx * d) + x];
-                Vj[(tx * d) + x] = V[qkv_base_offset + (tile_size * j) + (tx * d) + x];
+        for (int j = 0; j < numTiles; j++) {
+            for (int d = 0; d < D; d++) {
+                Kj[(tx * D) + d] = K[qkv_base_offset + (tile_size_m_d * j) + (tx * D) + d];
+                Vj[(tx * D) + d] = V[qkv_base_offset + (tile_size_m_d * j) + (tx * D) + d];
             }
             __syncthreads();
 
-            float row_m_block = -INFINITY;
-            for (int y = 0; y < WARP_SIZE; y++) {
+            float m_tile = -INFINITY;
+            for (int y = 0; y < tileSize; y++) {
                 float sum = 0.0f;
-                for (int x = 0; x < d; x++) {
-                    sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
+                for (int d = 0; d < D; d++) {
+                    sum += Qi[(tx * D) + d] * Kj[(y * D) + d];
                 }
                 sum *= softmax_scale;
-                S[(WARP_SIZE * tx) + y] = sum;
-                row_m_block = fmaxf(row_m_block, sum);
+                S[(tileSize * tx) + y] = sum;
+                m_tile = fmaxf(m_tile, sum);
             }
 
-            float row_l_block = 0.0f;
-            for (int y = 0; y < WARP_SIZE; y++) {
-                float p = __expf(S[(WARP_SIZE * tx) + y] - row_m_block);
-                S[(WARP_SIZE * tx) + y] = p;
-                row_l_block += p;
+            float l_tile = 0.0f;
+            for (int y = 0; y < tileSize; y++) {
+                S[(tileSize * tx) + y] = __expf(S[(tileSize * tx) + y] - m_tile);
+                l_tile += S[(tileSize * tx) + y];
             }
 
-            float m_new = fmaxf(m_curr, row_m_block);
-            float alpha = (m_curr == -INFINITY) ? 0.0f : __expf(m_curr - m_new);
-            float beta  = __expf(row_m_block - m_new);
+            float m_new = fmaxf(m_cur, m_tile);
+            float l_new = (__expf(m_cur - m_new) * l_cur) +
+                              (__expf(m_tile - m_new) * l_tile);
 
-            float l_new = (alpha * l_curr) + (beta * row_l_block);
-            float inv_l_new = 1.0f / l_new;
-
-            for (int x = 0; x < d; x++) {
-                float pv = 0.0f;
-                for (int y = 0; y < WARP_SIZE; y++) {
-                    pv += S[(WARP_SIZE * tx) + y] * Vj[(y * d) + x];
+            for (int d = 0; d < D; d++) {
+                float pv = 0.0;
+                for (int y = 0; y < tileSize; y++) {
+                    pv += S[(tileSize * tx) + y] * Vj[(y * D) + d];
                 }
 
-                int out_idx = qkv_base_offset + (tile_size * i) + (tx * d) + x;
+                int out_idx = qkv_base_offset + (tile_size_m_d * i) + (tx * D) + d;
                 float o_prev = O[out_idx];
-
-                float numerator = (alpha * l_curr * o_prev) + (beta * pv);
-                O[out_idx] = numerator * inv_l_new;
+                float numerator = __expf(m_cur - m_new) * l_cur * o_prev + __expf(m_tile - m_new) * pv;
+                O[out_idx] = numerator / l_new;
             }
 
-            m_curr = m_new;
-            l_curr = l_new;
+            m_cur = m_new;
+            l_cur = l_new;
 
             __syncthreads();
         }
@@ -102,59 +98,24 @@ __global__ void flash_attention_kernel_v2(
 }
 
 torch::Tensor forward_v2(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
-    const int B  = Q.size(0);
-    const int nh = Q.size(1);
-    const int L  = Q.size(2);
-    const int d  = Q.size(3);
+    const int B = Q.size(0);
+    const int H = Q.size(1);
+    const int L = Q.size(2);
+    const int D = Q.size(3);
 
-    const int Bc = WARP_SIZE;
-    const int Br = WARP_SIZE;
-
-    const int Tc = (L + Bc - 1) / Bc;
-    const int Tr = (L + Br - 1) / Br;
+    const int tileSize = WARP_SIZE;
+    const int numTiles = (L + tileSize - 1) / tileSize;
     const float softmax_scale = 1.0f / sqrtf((float)d);
-
     auto O = torch::zeros_like(Q);
-
     const int sram_size =
-        (3 * Bc * d * sizeof(float)) + (Bc * Br * sizeof(float));
+        (3 * tileSize * D * sizeof(float)) + (tileSize * tileSize * sizeof(float));
 
-    dim3 grid_dim(B, nh);
-    dim3 block_dim(WARP_SIZE);
+    dim3 grid_dim(B, H);
+    dim3 block_dim(tileSize);
 
     flash_attention_kernel_v2<<<grid_dim, block_dim, sram_size>>>(
         Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
-        L, d, Tc, Tr, softmax_scale,
-        O.data_ptr<float>()
-    );
-
-    return O;
-}
-
-torch::Tensor forward_v2(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
-    const int B  = Q.size(0);
-    const int nh = Q.size(1);
-    const int L  = Q.size(2);
-    const int d  = Q.size(3);
-
-    const int Bc = WARP_SIZE;
-    const int Br = WARP_SIZE;
-
-    const int Tc = (L + Bc - 1) / Bc;
-    const int Tr = (L + Br - 1) / Br;
-    const float softmax_scale = 1.0f / sqrtf((float)d);
-
-    auto O = torch::zeros_like(Q);
-
-    const int sram_size =
-        (3 * Bc * d * sizeof(float)) + (Bc * Br * sizeof(float));
-
-    dim3 grid_dim(B, nh);
-    dim3 block_dim(WARP_SIZE);
-
-    flash_attention_kernel_v2<<<grid_dim, block_dim, sram_size>>>(
-        Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
-        L, d, Tc, Tr, softmax_scale,
+        L, D, numTiles, tileSize, softmax_scale,
         O.data_ptr<float>()
     );
 
@@ -162,87 +123,89 @@ torch::Tensor forward_v2(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
 }
 
 __global__ void flash_attention_kernel(const float* Q, const float* K, const float* V,
-                                     const int L, const int d,
-                                     const int Tc, const int Tr, const int Bc, const int Br,
+                                     const int L, const int D,
+                                     const int numTiles, const int tileSize,
                                      const float softmax_scale,
                                      float* l, float* m, float* O) {
     int tx = threadIdx.x;
-    int bx = blockIdx.x; int by = blockIdx.y;
+    int bx = blockIdx.x, by = blockIdx.y;
+    // 最外两层是H行B列，有点反智但是无所谓了，正确得到qkv_offset和lm_offset即可
 
-    int qkv_offset = (by * gridDim.x * L * d) + (bx * L * d);
+    // 注意l和m都是H * B * L的总大小 
+
+    int qkv_offset = (by * gridDim.x * L * D) + (bx * L * D);
     int lm_offset  = (by * gridDim.x * L) + (bx * L);   
 
     // Define SRAM for Q,K,V,S
     extern __shared__ float sram[];
-    int tile_size = Bc * d;  // size of Qi, Kj, Vj
+    int tile_size_m_d = tileSize * D;  // size of Qi, Kj, Vj
     float* Qi = sram;
-    float* Kj = &sram[tile_size];
-    float* Vj = &sram[tile_size * 2];
-    float* S  = &sram[tile_size * 3];
+    float* Kj = &sram[tile_size_m_d];
+    float* Vj = &sram[tile_size_m_d * 2];
+    float* S  = &sram[tile_size_m_d * 3];
 
-    for (int x = 0; x < L; x += WARP_SIZE) { // Similar to Memory coalescing
-        if (x + tx < L) {
-            m[lm_offset + tx + x] = -INFINITY;
-            l[lm_offset + tx + x] = 0;
+    // 这里是初始化一下自己这个thread负责的所有行的m和l
+    for (int blk = 0; blk < L; blk += tileSize) { // Similar to Memory coalescing
+        if (blk + tx < L) {
+            m[lm_offset + tx + blk] = -INFINITY;
+            l[lm_offset + tx + blk] = 0;
         }
     }
 
-    for (int j = 0; j < Tc; j++) {
+    for (int j = 0; j < numTiles; j++) {
         // Load to shared memory
-        for (int x = 0; x < d; x++) {
-            Kj[(tx * d) + x] = K[qkv_offset + (tile_size * j) + (tx * d) + x];
-            Vj[(tx * d) + x] = V[qkv_offset + (tile_size * j) + (tx * d) + x];
+        for (int d = 0; d < D; d++) {
+            Kj[(tx * D) + d] = K[qkv_offset + (tile_size_m_d * j) + (tx * D) + d];
+            Vj[(tx * D) + d] = V[qkv_offset + (tile_size_m_d * j) + (tx * D) + d];
         }
         __syncthreads();  // such that the inner loop can use the correct Kj, Vj
 
-        for (int i = 0; i < Tr; i++)  {
-
-            // Load Qi to SRAM, l and m to registers
-            for (int x = 0; x < d; x++) {
-                Qi[(tx * d) + x] = Q[qkv_offset + (tile_size * i) + (tx * d) + x];
+        for (int i = 0; i < numTiles; i++)  {
+            for (int d = 0; d < D; d++) {
+                Qi[(tx * D) + d] = Q[qkv_offset + (tile_size_m_d * i) + (tx * D) + d];
             }
-            float row_m_prev = m[lm_offset + tx];
-            float row_l_prev = l[lm_offset + tx];
+            float m_prev = m[lm_offset + i * tileSize + tx];
+            float l_prev = l[lm_offset + i * tileSize + tx];
 
             // S = QK^T, row_m = rowmax(S)
-            float row_m = -INFINITY;
-            for (int y = 0; y < Bc; y++) {
+            float m_tile = -INFINITY;
+            for (int y = 0; y < tileSize; y++) {
                 float sum = 0;
-                for (int x = 0; x < d; x++) {
-                    sum += Qi[(tx * d) + x] * Kj[(y * d) + x];
+                for (int d = 0; d < D; d++) {
+                    sum += Qi[(tx * D) + d] * Kj[(y * D) + d];
                 }
                 sum *= softmax_scale;
-                S[(Bc * tx) + y] = sum;
+                S[(tileSize * tx) + y] = sum;
 
-                row_m = max(row_m, sum);
+                m_tile = fmaxf(m_tile, sum);
             }
 
-            // P = exp(S - row_m), row_l = rowsum(P)
-            float row_l = 0;
-            for (int y = 0; y < Bc; y++) {
-                S[(Bc * tx) + y] = __expf(S[(Bc * tx) + y] - row_m);
-                row_l += S[(Bc * tx) + y];
-            }
+            // P = exp(S - m_tile), l_tile = rowsum(P)
+            float l_tile = 0;
+            for (int y = 0; y < tileSize; y++) {
+                S[(tileSize * tx) + y] = __expf(S[(tileSize * tx) + y] - m_tile);
+                l_tile += S[(tileSize * tx) + y];
+            } // tile里自己的Softmax
 
             // Compute new m and l
-            float row_m_new = max(row_m_prev, row_m);
-            float row_l_new = (__expf(row_m_prev - row_m_new) * row_l_prev) +
-                              (__expf(row_m - row_m_new) * row_l);
+            float m_new = max(m_prev, m_tile);
+            float l_new = (__expf(m_prev - m_new) * l_prev) +
+                              (__expf(m_tile - m_new) * l_tile);
 
             // Write O, l, m to HBM
-            for (int x = 0; x < d; x++) {
+            for (int d = 0; d < D; d++) {
                 float pv = 0;  // Pij * Vj
-                for (int y = 0; y < Bc; y++) {
-                    pv += S[(Bc * tx) + y] * Vj[(y * d) + x];
+                for (int y = 0; y < tileSize; y++) {
+                    pv += S[(tileSize * tx) + y] * Vj[(y * D) + d];
                 }
-                O[qkv_offset + (tile_size * i) + (tx * d) + x] = (1.0f / row_l_new) *
-                    ((row_l_prev * __expf(row_m_prev - row_m_new) *
-                      O[qkv_offset + (tile_size * i) + (tx * d) + x]) +
-                     (__expf(row_m - row_m_new) * pv));
+                O[qkv_offset + (tile_size_m_d * i) + (tx * D) + d] = (1.0f / l_new) *
+                    ((l_prev * __expf(m_prev - m_new) *
+                      O[qkv_offset + (tile_size_m_d * i) + (tx * D) + d]) +
+                     (__expf(m_tile - m_new) * pv));
             }
 
-            m[lm_offset + tx] = row_m_new;
-            l[lm_offset + tx] = row_l_new;
+            m[lm_offset + tx + i * tileSize] = m_new;
+            l[lm_offset + tx + i * tileSize] = l_new;
         }
         __syncthreads();  // prevent thread from using the wrong Kj, Vj in inner loop
     }
@@ -250,31 +213,30 @@ __global__ void flash_attention_kernel(const float* Q, const float* K, const flo
 
 // https://chatgpt.com/share/693eeb9e-75fc-8003-a6fb-fff199dd52aa
 torch::Tensor forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V, bool use_tensor_cores) {
-    int Bc = WARP_SIZE, Br = WARP_SIZE;
+    int tileSize = WARP_SIZE;
 
-    const int B  = Q.size(0);
-    const int nh = Q.size(1);
-    const int L  = Q.size(2);
-    const int d  = Q.size(3);
+    const int B = Q.size(0);
+    const int H = Q.size(1);
+    const int L = Q.size(2);
+    const int D = Q.size(3);
 
-    const int Tc = (L + Bc - 1) / Bc;
-    const int Tr = (L + Br - 1) / Br;
-    const float softmax_scale = 1.0f / sqrtf((float)d);
+    const int numTiles = (L + tileSize - 1) / tileSize;
+    const float softmax_scale = 1.0f / sqrtf((float)D);
 
     auto O = torch::zeros_like(Q);
 
     float* l; float* m;
-    cudaMalloc((void**)&l, B * nh * L * sizeof(float));
-    cudaMalloc((void**)&m, B * nh * L * sizeof(float));
+    cudaMalloc((void**)&l, B * H * L * sizeof(float));
+    cudaMalloc((void**)&m, B * H * L * sizeof(float));
 
-    const int sram_size = (3 * Bc * d * sizeof(float)) + (Bc * Br * sizeof(float));
+    const int sram_size = (3 * tileSize * D * sizeof(float)) + (tileSize * tileSize * sizeof(float));
 
-    dim3 grid_dim(B, nh);
-    dim3 block_dim(WARP_SIZE);
+    dim3 grid_dim(B, H);
+    dim3 block_dim(tileSize);
 
     flash_attention_kernel<<<grid_dim, block_dim, sram_size>>>(
         Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
-        L, d, Tc, Tr, Bc, Br, softmax_scale,
+        L, D, numTiles, tileSize, softmax_scale,
         l, m, O.data_ptr<float>()
     );
 
@@ -284,373 +246,264 @@ torch::Tensor forward(torch::Tensor Q, torch::Tensor K, torch::Tensor V, bool us
     return O;
 }
 
-__global__ void flash_attention_kernel_v3(
-    const float* Q, const float* K, const float* V,
-    const int L, const int d,
-    const int Tc, const int Tr,
-    const float softmax_scale,
-    float* O
-) {
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    int bx = blockIdx.x;
-    int by = blockIdx.y;
+// __global__ void flash_attention_kernel_v3(
+//     const float* Q, const float* K, const float* V,
+//     const int L, const int D,
+//     const int numTiles, const int tileSize,
+//     const float softmax_scale,
+//     float* O
+// ) {
+//     int tx = threadIdx.x;
+//     int ty = threadIdx.y;
+//     int bx = blockIdx.x;
+//     int by = blockIdx.y;
 
-    int qkv_base_offset = (by * gridDim.x * L * d) + (bx * L * d);
+//     int qkv_base_offset = (by * gridDim.x * L * D) + (bx * L * D);
 
-    extern __shared__ float sram[];
-    int tile_size = WARP_SIZE * d;
+//     extern __shared__ float sram[];
+//     int tile_size_m_D = tileSize * D;
 
-    float* Qi = sram;
-    float* Kj = &sram[tile_size];
-    float* Vj = &sram[tile_size * 2];
-    float* S  = &sram[tile_size * 3];
+//     float* Qi = sram;
+//     float* Kj = &sram[tile_size_m_D];
+//     float* Vj = &sram[tile_size_m_D * 2];
+//     float* S  = &sram[tile_size_m_D * 3];
 
-    float* R = &S[WARP_SIZE * WARP_SIZE];
-    float* row_mbuf = &R[WARP_SIZE * WARP_SIZE];
-    float* row_lbuf = &row_mbuf[WARP_SIZE];
-    float* row_abuf = &row_lbuf[WARP_SIZE];
-    float* row_bbuf = &row_abuf[WARP_SIZE];
-    float* row_mnew = &row_bbuf[WARP_SIZE];
-    float* row_lnew = &row_mnew[WARP_SIZE];
+//     float* R = &S[tileSize * tileSize];
+//     float* row_mbuf = &R[tileSize * tileSize];
+//     float* row_lbuf = &row_mbuf[tileSize];
+//     float* row_abuf = &row_lbuf[tileSize];
+//     float* row_bbuf = &row_abuf[tileSize];
+//     float* row_mnew = &row_bbuf[tileSize];
+//     float* row_lnew = &row_mnew[tileSize];
 
-    for (int i = 0; i < Tr; i++) {
-        int q_row = i * WARP_SIZE + ty;
-        int q_off = qkv_base_offset + q_row * d;
+//     for (int i = 0; i < numTiles; i++) {
+//         int q_row = i * tileSize + ty;
+//         int q_off = qkv_base_offset + q_row * D;
 
-        for (int x = tx; x < d; x += WARP_SIZE) {
-            Qi[ty * d + x] = Q[q_off + x];
-            O[q_off + x] = 0.0f;
-        }
+//         for (int d = tx; d < D; d += tileSize) {
+//             Qi[ty * D + d] = Q[q_off + d];
+//             O[q_off + d] = 0.0f;
+//         }
 
-        float m_curr = -INFINITY;
-        float l_curr = 0.0f;
+//         float m_cur = -INFINITY;
+//         float l_cur = 0.0f;
 
-        __syncthreads();
+//         __syncthreads();
 
-        for (int j = 0; j < Tc; j++) {
-            int k_row = j * WARP_SIZE + ty;
-            int k_off = qkv_base_offset + k_row * d;
+//         for (int j = 0; j < numTiles; j++) {
+//             int k_row = j * tileSize + ty;
+//             int k_off = qkv_base_offset + k_row * D;
 
-            for (int x = tx; x < d; x += WARP_SIZE) {
-                Kj[ty * d + x] = K[k_off + x];
-                Vj[ty * d + x] = V[k_off + x];
-            }
+//             for (int d = tx; d < D; d += tileSize) {
+//                 Kj[ty * D + d] = K[k_off + d];
+//                 Vj[ty * D + d] = V[k_off + d];
+//             }
 
-            __syncthreads();
+//             __syncthreads();
 
-            float row_m_block = -INFINITY;
+//             float row_m_block = -INFINITY;
 
-            for (int y = 0; y < WARP_SIZE; y++) {
-                float partial = 0.0f;
-                for (int x = tx; x < d; x += WARP_SIZE) {
-                    partial += Qi[ty * d + x] * Kj[y * d + x];
-                }
+//             for (int y = 0; y < tileSize; y++) {
+//                 float partial = 0.0f;
+//                 for (int d = tx; d < D; d += tileSize) {
+//                     partial += Qi[ty * D + d] * Kj[y * D + d];
+//                 }
 
-                int base = ty * WARP_SIZE + tx;
-                R[base] = partial;
-                __syncthreads();
+//                 int base = ty * tileSize + tx;
+//                 R[base] = partial;
+//                 __syncthreads();
 
-                for (int stride = WARP_SIZE / 2; stride > 0; stride >>= 1) {
-                    if (tx < stride) {
-                        R[ty * WARP_SIZE + tx] += R[ty * WARP_SIZE + tx + stride];
-                    }
-                    __syncthreads();
-                }
+//                 for (int stride = tileSize / 2; stride > 0; stride >>= 1) {
+//                     if (tx < stride) {
+//                         R[ty * tileSize + tx] += R[ty * tileSize + tx + stride];
+//                     }
+//                     __syncthreads();
+//                 }
 
-                if (tx == 0) {
-                    float s = R[ty * WARP_SIZE + 0] * softmax_scale;
-                    S[ty * WARP_SIZE + y] = s;
-                    row_m_block = fmaxf(row_m_block, s);
-                }
+//                 if (tx == 0) {
+//                     float s = R[ty * tileSize + 0] * softmax_scale;
+//                     S[ty * tileSize + y] = s;
+//                     row_m_block = fmaxf(row_m_block, s);
+//                 }
 
-                __syncthreads();
-            }
+//                 __syncthreads();
+//             }
 
-            if (tx == 0) {
-                row_mbuf[ty] = row_m_block;
-            }
-            __syncthreads();
+//             if (tx == 0) {
+//                 row_mbuf[ty] = row_m_block;
+//             }
+//             __syncthreads();
 
-            row_m_block = row_mbuf[ty];
+//             row_m_block = row_mbuf[ty];
 
-            float p = __expf(S[ty * WARP_SIZE + tx] - row_m_block);
-            S[ty * WARP_SIZE + tx] = p;
+//             float p = __expf(S[ty * tileSize + tx] - row_m_block);
+//             S[ty * tileSize + tx] = p;
 
-            R[ty * WARP_SIZE + tx] = p;
-            __syncthreads();
+//             R[ty * tileSize + tx] = p;
+//             __syncthreads();
 
-            for (int stride = WARP_SIZE / 2; stride > 0; stride >>= 1) {
-                if (tx < stride) {
-                    R[ty * WARP_SIZE + tx] += R[ty * WARP_SIZE + tx + stride];
-                }
-                __syncthreads();
-            }
+//             for (int stride = tileSize / 2; stride > 0; stride >>= 1) {
+//                 if (tx < stride) {
+//                     R[ty * tileSize + tx] += R[ty * tileSize + tx + stride];
+//                 }
+//                 __syncthreads();
+//             }
 
-            float row_l_block = 0.0f;
-            if (tx == 0) {
-                row_l_block = R[ty * WARP_SIZE + 0];
-                row_lbuf[ty] = row_l_block;
+//             float row_l_block = 0.0f;
+//             if (tx == 0) {
+//                 row_l_block = R[ty * tileSize + 0];
+//                 row_lbuf[ty] = row_l_block;
 
-                float m_new = fmaxf(m_curr, row_m_block);
-                float alpha = (m_curr == -INFINITY) ? 0.0f : __expf(m_curr - m_new);
-                float beta  = __expf(row_m_block - m_new);
-                float l_new = (alpha * l_curr) + (beta * row_l_block);
+//                 float m_new = fmaxf(m_cur, row_m_block);
+//                 float alpha = (m_cur == -INFINITY) ? 0.0f : __expf(m_cur - m_new);
+//                 float beta  = __expf(row_m_block - m_new);
+//                 float l_new = (alpha * l_cur) + (beta * row_l_block);
 
-                row_abuf[ty] = alpha;
-                row_bbuf[ty] = beta;
-                row_mnew[ty] = m_new;
-                row_lnew[ty] = l_new;
-            }
-            __syncthreads();
+//                 row_abuf[ty] = alpha;
+//                 row_bbuf[ty] = beta;
+//                 row_mnew[ty] = m_new;
+//                 row_lnew[ty] = l_new;
+//             }
+//             __syncthreads();
 
-            float alpha = row_abuf[ty];
-            float beta  = row_bbuf[ty];
-            float m_new = row_mnew[ty];
-            float l_new = row_lnew[ty];
-            float inv_l_new = 1.0f / l_new;
+//             float alpha = row_abuf[ty];
+//             float beta  = row_bbuf[ty];
+//             float m_new = row_mnew[ty];
+//             float l_new = row_lnew[ty];
+//             float inv_l_new = 1.0f / l_new;
 
-            for (int x = tx; x < d; x += WARP_SIZE) {
-                float pv = 0.0f;
-                for (int y = 0; y < WARP_SIZE; y++) {
-                    pv += S[ty * WARP_SIZE + y] * Vj[y * d + x];
-                }
+//             for (int d = tx; d < D; d += tileSize) {
+//                 float pv = 0.0f;
+//                 for (int y = 0; y < tileSize; y++) {
+//                     pv += S[ty * tileSize + y] * Vj[y * D + d];
+//                 }
 
-                float o_prev = O[q_off + x];
-                float numerator = (alpha * l_curr * o_prev) + (beta * pv);
-                O[q_off + x] = numerator * inv_l_new;
-            }
+//                 float o_prev = O[q_off + d];
+//                 float numerator = (alpha * l_cur * o_prev) + (beta * pv);
+//                 O[q_off + d] = numerator * inv_l_new;
+//             }
 
-            m_curr = m_new;
-            l_curr = l_new;
+//             m_cur = m_new;
+//             l_cur = l_new;
 
-            __syncthreads();
-        }
+//             __syncthreads();
+//         }
 
-        __syncthreads();
-    }
-}
+//         __syncthreads();
+//     }
+// }
 
-torch::Tensor forward_v3(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
-    const int B  = Q.size(0);
-    const int nh = Q.size(1);
-    const int L  = Q.size(2);
-    const int d  = Q.size(3);
+// torch::Tensor forward_v3(torch::Tensor Q, torch::Tensor K, torch::Tensor V) {
+//     const int B  = Q.size(0);
+//     const int H  = Q.size(1);
+//     const int L  = Q.size(2);
+//     const int D  = Q.size(3);
 
-    const int Bc = WARP_SIZE;
-    const int Br = WARP_SIZE;
+//     const int tileSize = tileSize;
 
-    const int Tc = (L + Bc - 1) / Bc;
-    const int Tr = (L + Br - 1) / Br;
-    const float softmax_scale = 1.0f / sqrtf((float)d);
+//     const int numTiles = (L + tileSize - 1) / tileSize;
+//     const float softmax_scale = 1.0f / sqrtf((float)D);
 
-    auto O = torch::zeros_like(Q);
+//     auto O = torch::zeros_like(Q);
 
-    const int extra_floats = (Bc * Br) + (6 * Br);
-    const int sram_size =
-        (3 * Bc * d * sizeof(float)) +
-        (Bc * Br * sizeof(float)) +
-        (extra_floats * sizeof(float));
+//     const int extra_floats = (tileSize * tileSize) + (6 * tileSize);
+//     const int sram_size =
+//         (3 * tileSize * D * sizeof(float)) +
+//         (tileSize * tileSize * sizeof(float)) +
+//         (extra_floats * sizeof(float));
 
-    dim3 grid_dim(B, nh);
-    dim3 block_dim(WARP_SIZE, WARP_SIZE);
+//     dim3 grid_dim(B, H);
+//     dim3 block_dim(tileSize, tileSize);
 
-    flash_attention_kernel_v3<<<grid_dim, block_dim, sram_size>>>(
-        Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
-        L, d, Tc, Tr, softmax_scale,
-        O.data_ptr<float>()
-    );
+//     flash_attention_kernel_v3<<<grid_dim, block_dim, sram_size>>>(
+//         Q.data_ptr<float>(), K.data_ptr<float>(), V.data_ptr<float>(),
+//         L, D, numTiles, tileSize, softmax_scale,
+//         O.data_ptr<float>()
+//     );
 
-    return O;
-}
-
-// Streaming processor (CUDA Core)
-// Cores in an SM are grouped further into processing blocks.
-// 1 Processing Block = 32 Cores = 1 Warp or it can have multiple warps
-
-/* 
-共容/互斥：__host__ 和 __device__ 可同时出现（生成 host+device 两个版本）；__global__ 与 __host__/__device__ 互斥。
-调用关系：host 不能调用 __device__；host 可以 <<<>>> 调 __global__；
-kernel 内可普通调用 __device__/__host__ __device__(device 版)。
-kernel 内不能把另一个 __global__ 当普通函数调用；只能用 child<<<>>> 做 device-side launch
-（需 Dynamic Parallelism + 相应编译/链接选项），并且 launch 有额外开销/同步语义。
-*/
-
-/*
- * - CPU: optimized for sequential performance
- *   - Large chip area for fast arithmetic (strong single-thread cores)
- *   - Multi-level caches for low-latency data access
- *   - Branch prediction, out-of-order execution, etc.
- *
- * - GPU: optimized for massive parallel throughput
- *   - Very large number of cores/ALUs to run many threads concurrently
- *   - Higher memory bandwidth (to feed many threads)
- *
- * - Host-side sync: after a kernel launch, call cudaDeviceSynchronize()
- *   to block the CPU until the kernel finishes (and to surface async errors).
- *
- * - Block-level sync: __syncthreads() is an intrinsic barrier that
- *   synchronizes all threads within the *same* thread block.
- */
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <cuda_runtime.h>
-
-#define BLOCK_DIM_X 8
-#define BLOCK_DIM_Y 8
-
-__device__ __forceinline__ double func(double x, double y)
-{
-  return x*x + y*y;
-}
-
-__global__ void compute_laplacian(int Nx, int Ny,
-    double xstart, double ystart, double dx, double dy, double *result)
-{
-  __shared__ double f[BLOCK_DIM_X][BLOCK_DIM_Y];
-
-  int i = threadIdx.x, j = threadIdx.y;
-  int nx = BLOCK_DIM_X - 2, ny = BLOCK_DIM_Y - 2;
-
-  int ix = (int)blockIdx.x * nx + i - 1;
-  int iy = (int)blockIdx.y * ny + j - 1;
-
-  double v = 0.0;
-  if (0 <= ix && ix < Nx && 0 <= iy && iy < Ny) {
-    double x = xstart + ix * dx;
-    double y = ystart + iy * dy;
-    v = func(x, y);
-  }
-  f[i][j] = v;
-  __syncthreads();
-
-  if (1 <= i && i <= nx && 1 <= j && j <= ny &&
-      1 <= ix && ix < Nx-1 && 1 <= iy && iy < Ny-1) {
-    result[ix * Ny + iy] =
-        (f[i-1][j] - 2.0*f[i][j] + f[i+1][j]) / (dx*dx) +
-        (f[i][j-1] - 2.0*f[i][j] + f[i][j+1]) / (dy*dy);
-  }
-}
-
-int main()
-{
-  double xstart = -1.0, ystart = -1.0;
-  int Nx = 200, Ny = 400;
-
-  if (Nx < 3 || Ny < 3) return 1;
-
-  double dx = 2.0 / (Nx - 1);
-  double dy = 2.0 / (Ny - 1);
-
-  double *laplacian_d = NULL;
-  cudaMalloc(&laplacian_d, (size_t)Nx * (size_t)Ny * sizeof(double));
-  cudaMemset(laplacian_d, 0, (size_t)Nx * (size_t)Ny * sizeof(double));
-
-  dim3 dimBlock(BLOCK_DIM_X, BLOCK_DIM_Y);
-  int nx = BLOCK_DIM_X - 2, ny = BLOCK_DIM_Y - 2;
-  dim3 dimGrid((Nx + nx - 1) / nx, (Ny + ny - 1) / ny);
-
-  compute_laplacian<<<dimGrid, dimBlock>>>(Nx, Ny, xstart, ystart, dx, dy, laplacian_d);
-  cudaDeviceSynchronize();
-
-  double *laplacian = (double*)malloc((size_t)Nx * (size_t)Ny * sizeof(double));
-  cudaMemcpy(laplacian, laplacian_d,
-             (size_t)Nx * (size_t)Ny * sizeof(double),
-             cudaMemcpyDeviceToHost);
-
-  for (int i = 0; i < Nx; i++) {
-    for (int j = 0; j < Ny; j++)
-      printf("%lf\t", laplacian[i * Ny + j]);
-    printf("\n");
-  }
-
-  cudaFree(laplacian_d);
-  free(laplacian);
-  return 0;
-}
+//     return O;
+// }
 
 #define BLOCK_DIM 16
-#define n 200
+#define N 200
 #define COARSENING_FACTOR 4
 
-__global__ void mat_mul(int N, double *A, double *B, double *C)
-{
-  int i = blockIdx.x * blockDim.x + threadIdx.x;
-  int j = blockIdx.y * blockDim.y + threadIdx.y;
+__global__ void mat_mul(int N, double *A, double *B, double *C) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
 
-  if (i < N && j < N) {
-    double sum = 0;
-    for (int k = 0; k < N; k++)
-      sum += A[i * N + k] * B[k * N + j];
-    C[i * N + j] = sum;
-  }
-}
-
-__global__ void mat_mul_v2(int N, double *A, double *B, double *C)
-{
-  __shared__ double As[BLOCK_DIM][BLOCK_DIM];
-  __shared__ double Bs[BLOCK_DIM][BLOCK_DIM];
-  int i = blockIdx.x * BLOCK_DIM + threadIdx.x;
-  int j = blockIdx.y * BLOCK_DIM + threadIdx.y;
-
-  double sum = 0;
-  for (int p = 0; p < (N+BLOCK_DIM-1) / BLOCK_DIM; p++) {
-    int k_start = p * BLOCK_DIM;
-
-    if (i < N && k_start + threadIdx.y < N)
-      As[threadIdx.x][threadIdx.y] =
-        A[i * N + k_start + threadIdx.y];
-
-    if (k_start + threadIdx.x < N && j < N)
-      Bs[threadIdx.x][threadIdx.y] =
-        B[(k_start + threadIdx.x) * N + j];
-
-    __syncthreads();
-
-    if (i < N && j < N)
-      for (int k = 0; k < BLOCK_DIM && k_start + k < N; k++)
-        sum += As[threadIdx.x][k] * Bs[k][threadIdx.y];
-
-    __syncthreads();
-  }
-
-  if (i < N && j < N) C[i * N + j] = sum;
-}
-
-__global__ void mat_mul_v3(int N, double *A, double *B, double *C)
-{
-  __shared__ double As[BLOCK_DIM][BLOCK_DIM], Bs[BLOCK_DIM][BLOCK_DIM];
-  int i = blockIdx.x * BLOCK_DIM + threadIdx.x;
-  int jstart = (blockIdx.y * BLOCK_DIM + threadIdx.y) * COARSENING_FACTOR;
-
-  double Cvalue[COARSENING_FACTOR];
-  for (int c = 0; c < COARSENING_FACTOR; c++) Cvalue[c] = 0;
-  
-  for (int p = 0; p < (N+BLOCK_DIM-1) / BLOCK_DIM; p++) {
-    int k_start = p * BLOCK_DIM;
-
-    if (i < N && k_start + threadIdx.y < N)
-      As[threadIdx.x][threadIdx.y] = A[i * N + k_start + threadIdx.y];
-
-    for (int c = 0; c < COARSENING_FACTOR; c++) {
-      int j = jstart + c;
-      if (k_start + threadIdx.x < N && j < N)
-        Bs[threadIdx.x][threadIdx.y] = B[(k_start + threadIdx.x) * N + j];
-      __syncthreads();
-
-      if (i < N && j < N)
-        for (int k = 0; k < BLOCK_DIM && k_start + k < N; k++)
-          Cvalue[c] += As[threadIdx.x][k] * Bs[k][threadIdx.y];
-      __syncthreads();
+    if (row < N && col < N) {
+        double sum = 0;
+        for (int k = 0; k < N; k++)
+            sum += A[row * N + k] * B[k * N + col];
+        C[row * N + col] = sum;
     }
-  }
-
-  for (c = 0; c < COARSENING_FACTOR; c++) {
-    int j = jstart + c;
-    if (i < N && j < N) C[i * N + j] = Cvalue[c];
-  }
 }
+
+__global__ void mat_mul_v2(int N, double *A, double *B, double *C) {
+    __shared__ double As[BLOCK_DIM][BLOCK_DIM];
+    __shared__ double Bs[BLOCK_DIM][BLOCK_DIM];
+    int row_local = threadIdx.y, col_local = threadIdx.x;
+    int row = blockIdx.y * blockDim.y + row_local;
+    int col = blockIdx.x * blockDim.x + col_local;
+
+    double sum = 0;
+    for (int p = 0; p < (N+BLOCK_DIM-1) / BLOCK_DIM; p++) {
+        int k_start = p * BLOCK_DIM;
+
+        if (row < N && k_start + col_local < N)
+        As[row_local][col_local] =
+            A[row * N + k_start + col_local];
+
+        if (k_start + row_local < N && col < N)
+        Bs[row_local][col_local] =
+            B[(k_start + row_local) * N + col];
+
+        __syncthreads();
+
+        if (row < N && col < N)
+            for (int k = 0; k < BLOCK_DIM && k_start + k < N; k++)
+                sum += As[row_local][k] * Bs[k][col_local];
+
+        __syncthreads();
+    }
+
+    if (row < N && col < N) C[row * N + col] = sum;
+}
+
+// __global__ void mat_mul_v3(int N, double *A, double *B, double *C)
+// {
+//   __shared__ double As[BLOCK_DIM][BLOCK_DIM], Bs[BLOCK_DIM][BLOCK_DIM];
+//   int i = blockIdx.x * BLOCK_DIM + threadIdx.x;
+//   int jstart = (blockIdx.y * BLOCK_DIM + threadIdx.y) * COARSENING_FACTOR;
+
+//   double Cvalue[COARSENING_FACTOR];
+//   for (int c = 0; c < COARSENING_FACTOR; c++) Cvalue[c] = 0;
+  
+//   for (int p = 0; p < (N+BLOCK_DIM-1) / BLOCK_DIM; p++) {
+//     int k_start = p * BLOCK_DIM;
+
+//     if (i < N && k_start + threadIdx.y < N)
+//       As[threadIdx.x][threadIdx.y] = A[i * N + k_start + threadIdx.y];
+
+//     for (int c = 0; c < COARSENING_FACTOR; c++) {
+//       int j = jstart + c;
+//       if (k_start + threadIdx.x < N && j < N)
+//         Bs[threadIdx.x][threadIdx.y] = B[(k_start + threadIdx.x) * N + j];
+//       __syncthreads();
+
+//       if (i < N && j < N)
+//         for (int k = 0; k < BLOCK_DIM && k_start + k < N; k++)
+//           Cvalue[c] += As[threadIdx.x][k] * Bs[k][threadIdx.y];
+//       __syncthreads();
+//     }
+//   }
+
+//   for (c = 0; c < COARSENING_FACTOR; c++) {
+//     int j = jstart + c;
+//     if (i < N && j < N) C[i * N + j] = Cvalue[c];
+//   }
+// }
 
 /* 
 Each time a location in the global memory is accessed, a range of
@@ -659,48 +512,50 @@ transferred to the processor at high speed. This is known as DRAM
 bursts. Adjacent memory for multiple threads.
 */
 
+// V4: Thread Coarsening + Memory Coalescing
 __global__ void mat_mul_v4(int N, double *A, double *B, double *C)
 {
   __shared__ double As[BLOCK_DIM][BLOCK_DIM], Bs[BLOCK_DIM][BLOCK_DIM];
-  int i = blockIdx.x * BLOCK_DIM + threadIdx.x, c;
-  int j = blockIdx.y * BLOCK_DIM * COARSENING_FACTOR + threadIdx.y;
+  int row_local = threadIdx.y, col_local = threadIdx.x;
+  int row = blockIdx.y * BLOCK_DIM + row_local;
+  int col = blockIdx.x * BLOCK_DIM * COARSENING_FACTOR + col_local;
 
-  double Cvalue[COARSENING_FACTOR];
-  for (c = 0; c < COARSENING_FACTOR; c++) Cvalue[c] = 0;
+  double Cval[COARSENING_FACTOR];
+  for (c = 0; c < COARSENING_FACTOR; c++) Cval[c] = 0;
   
   for (int p = 0; p < (N+BLOCK_DIM-1) / BLOCK_DIM; p++) {
     int k_start = p * BLOCK_DIM;
 
-    if (i < N && k_start + threadIdx.y < N)
-      As[threadIdx.x][threadIdx.y] = A[i * N + k_start + threadIdx.y];
+    if (row < N && k_start + col_local < N)
+        As[row_local][col_local] = A[row * N + k_start + col_local];
 
     for (c = 0; c < COARSENING_FACTOR; c++) {
-      int real_j = j + c * BLOCK_DIM;
-      if (k_start + threadIdx.x < N && real_j < N)
-        Bs[threadIdx.x][threadIdx.y] = B[(k_start + threadIdx.x) * N + real_j];
+      int real_col = col + c * BLOCK_DIM;
+      if (k_start + row_local < N && real_col < N)
+        Bs[row_local][col_local] = B[(k_start + row_local) * N + real_col];
       __syncthreads();
 
-      if (i < N && real_j < N)
+      if (row < N && real_col < N)
         for (int k = 0; k < BLOCK_DIM && k_start + k < N; k++)
-          Cvalue[c] += As[threadIdx.x][k] * Bs[k][threadIdx.y];
+          Cvalue[c] += As[row_local][k] * Bs[k][col_local];
       __syncthreads();
     }
   }
 
   for (c = 0; c < COARSENING_FACTOR; c++) {
-    int real_j = j + c * BLOCK_DIM;
-    if (i < N && real_j < N) C[i * N + real_j] = Cvalue[c];
+    int real_col = col + c * BLOCK_DIM;
+    if (row < N && real_col < N) C[row * N + real_col] = Cvalue[c];
   }
 }
 
 /*Thread coarsening:
-I We will have less data accesses from the global memory if the
+We will have less data accesses from the global memory if the
 number of blocks is smaller, or the block dimension is larger.
-I However, the block dimension is limited by the shared memory.
-I When the size of the matrices is large, the number of blocks may be
+However, the block dimension is limited by the shared memory.
+When the size of the matrices is large, the number of blocks may be
 many times the number of SMs, so that some blocks are actually
 executed sequentially.
-I In this case, we may increase the workload of each thread and
+In this case, we may increase the workload of each thread and
 decrease the number of blocks, which often achieves better
 ciency. Technique is called thread coarsening. */
 
@@ -725,7 +580,7 @@ void mat_mul_main() {
   cudaMemcpy(B_d, B, n * n * sizeof(double), cudaMemcpyHostToDevice);
 
   dim3 dimBlock(BLOCK_DIM, BLOCK_DIM);
-  dim3 dimGrid((n+BLOCK_DIM-1) / BLOCK_DIM, (n+BLOCK_DIM-1) / (BLOCK_DIM*COARSENING_FACTOR));
+  dim3 dimGrid((n+BLOCK_DIM-1) / (BLOCK_DIM*COARSENING_FACTOR), (n+BLOCK_DIM-1) / BLOCK_DIM);
   mat_mul<<<dimGrid, dimBlock>>>(n, A_d, B_d, C_d);
   cudaDeviceSynchronize();
 
@@ -736,9 +591,6 @@ void mat_mul_main() {
   free(A); free(B); free(C);
   return 0;
 }
-
-#include <stdio.h>
-#include <cuda_runtime.h>
 
 __global__ void all_sum_reduce(int *in, int *out, int n) {
     extern __shared__ int sdata[];
@@ -790,27 +642,27 @@ int main() {
 // 树状数组lowbit是管理的长度 (i-lowbit(i), i]
 // 加的时候只要考虑后续有哪些节点管理的区间包含当前节点
 
-__global__ void segmented_scan_native(int n, int *array, int *prefix_sum)
-{
-    __shared__ int arr[BLOCK_DIM], location, mutex;
-    int leave = 0, idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) arr[threadIdx.x] = array[idx];
-    if (threadIdx.x == 0) location = mutex = 0;
-    __syncthreads();
+// __global__ void segmented_scan_naive(int n, int *array, int *prefix_sum)
+// {
+//     __shared__ int arr[BLOCK_DIM], location, mutex;
+//     int leave = 0, idx = blockIdx.x * blockDim.x + threadIdx.x;
+//     if (idx < n) arr[threadIdx.x] = array[idx];
+//     if (threadIdx.x == 0) location = mutex = 0;
+//     __syncthreads();
 
-    if (threadIdx.x != 0 && idx < n)
-        while (!leave) {
-            if (atomicExch(&mutex, 1) == 0) {
-                location++;
-                arr[location] += arr[location-1];
-                __threadfence_block();
-                leave = 1;
-                atomicExch(&mutex, 0);
-            }
-        }
-    __syncthreads();
-    if (idx < n) prefix_sum[idx] = arr[threadIdx.x];
-}
+//     if (threadIdx.x != 0 && idx < n)
+//         while (!leave) {
+//             if (atomicExch(&mutex, 1) == 0) {
+//                 location++;
+//                 arr[location] += arr[location-1];
+//                 __threadfence_block();
+//                 leave = 1;
+//                 atomicExch(&mutex, 0);
+//             }
+//         }
+//     __syncthreads();
+//     if (idx < n) prefix_sum[idx] = arr[threadIdx.x];
+// }
 
 __global__ void prefix_scan_self_invented(int n, int* array, int *prefix_sum) {
   __shared__ int sdata[];
@@ -820,7 +672,7 @@ __global__ void prefix_scan_self_invented(int n, int* array, int *prefix_sum) {
   sdata[tid] = array[tid];
   __syncthreads();
 
-  for (int stride = n / 2; stride > 0; stride /= 2) {
+  for (int stride = n / 2; stride >= 1; stride /= 2) {
       
       int val = sdata[tid];
       __syncthreads();
@@ -836,7 +688,7 @@ __global__ void prefix_scan_self_invented(int n, int* array, int *prefix_sum) {
   if (idx < n) prefix_sum[idx] = array[threadIdx.x];
 }
 
-__global__ void prefix_scan_koggle_stone(int n, int *array, int *prefix_sum)
+__global__ void prefix_scan_kogge_stone(int n, int *array, int *prefix_sum)
 {
     __shared__ int arr[BLOCK_DIM];
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -856,7 +708,8 @@ __global__ void prefix_scan_koggle_stone(int n, int *array, int *prefix_sum)
 __device__ int block_idx = 0;
 __device__ int block_counter = 0;
 
-__device__ void prefix_scan_koggle_stone(int n, int *array, int *prefix_sum)
+// device version, above was global version
+__device__ void prefix_scan_kogge_stone(int n, int *array, int *prefix_sum)
 {
     __shared__ int arr[BLOCK_DIM];
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -873,7 +726,7 @@ __device__ void prefix_scan_koggle_stone(int n, int *array, int *prefix_sum)
     if (idx < n) prefix_sum[idx] = arr[threadIdx.x];
 }
 
-__global__ void prefix_scan_brent_kung_native(int n, int *array, int *prefix_sum)
+__global__ void prefix_scan_brent_kung_naive(int n, int *array, int *prefix_sum)
 {
     __shared__ int arr[BLOCK_DIM];
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
@@ -936,14 +789,12 @@ __global__ void prefix_scan_brent_kung_optimzed_for_ctrl_divergence(int n, int *
     if (idx < n) arr[threadIdx.x] = array[idx];
     if (idx + BLOCK_DIM < n) arr[threadIdx.x + BLOCK_DIM] = array[idx + BLOCK_DIM];
 
-    // Reduction Phase (Up-Sweep)
     for (int stride = 1; stride <= BLOCK_DIM; stride *= 2) {
         __syncthreads();
         int i = stride * 2 * (threadIdx.x + 1) - 1;
         if (i < 2*BLOCK_DIM) arr[i] += arr[i - stride];
     }
 
-    // Distribution Phase (Down-Sweep)
     for (int stride = BLOCK_DIM/2; stride > 0; stride /= 2) {
         __syncthreads();
         int i = 2 * stride * threadIdx.x - 1 + stride;
@@ -952,25 +803,61 @@ __global__ void prefix_scan_brent_kung_optimzed_for_ctrl_divergence(int n, int *
 
     __syncthreads();
     
-    // Write results back to global memory
     if (idx < n) prefix_sum[idx] = arr[threadIdx.x];
     if (idx + BLOCK_DIM < n) prefix_sum[idx + BLOCK_DIM] = arr[threadIdx.x + BLOCK_DIM];
 }*/
 
+// __global__ void SinglePass(int n, int *array, int *partial_sum, int *prefix_sum)
+// {
+//     __shared__ int arr[2*BLOCK_DIM], scan_block_idx;
+    
+//     if (threadIdx.x == 0)
+//         scan_block_idx = atomicAdd(&block_idx, 1);
+//     __syncthreads();
+
+//     int idx = 2 * scan_block_idx * blockDim.x + threadIdx.x;
+
+//     if (idx < n) arr[threadIdx.x] = array[idx];
+//     if (idx + BLOCK_DIM < n) arr[threadIdx.x + BLOCK_DIM] = array[idx + BLOCK_DIM];
+    
+//     prefix_scan_kogge_stone(BLOCK_DIM, arr, arr+BLOCK_DIM);
+
+//     __syncthreads();
+
+//     if (threadIdx.x == 0) {
+//         if (scan_block_idx != 0)
+//             while (atomicAdd(&block_counter, 0) != scan_block_idx) {}
+//         else
+//             partial_sum[0] = 0;
+
+//         partial_sum[scan_block_idx + 1] = partial_sum[scan_block_idx] + arr[2*BLOCK_DIM-1];
+        
+//         __threadfence();
+//         atomicAdd(&block_counter, 1);
+//     }
+//     __syncthreads();
+
+//     if (idx < n)
+//         prefix_sum[idx] = arr[threadIdx.x] + partial_sum[scan_block_idx];
+//     if (idx + BLOCK_DIM < n)
+//         prefix_sum[idx + BLOCK_DIM] = arr[threadIdx.x + BLOCK_DIM] + partial_sum[scan_block_idx];
+
+//     __syncthreads();
+// }
+
 __global__ void SinglePass(int n, int *array, int *partial_sum, int *prefix_sum)
 {
-    __shared__ int arr[2*BLOCK_DIM], scan_block_idx;
+    __shared__ int arr[BLOCK_DIM], scan_block_idx;
     
     if (threadIdx.x == 0)
         scan_block_idx = atomicAdd(&block_idx, 1);
     __syncthreads();
 
-    int idx = 2 * scan_block_idx * blockDim.x + threadIdx.x;
+    int idx = scan_block_idx * blockDim.x + threadIdx.x;
 
     if (idx < n) arr[threadIdx.x] = array[idx];
-    if (idx + BLOCK_DIM < n) arr[threadIdx.x + BLOCK_DIM] = array[idx + BLOCK_DIM];
     
-    prefix_scan_koggle_stone(BLOCK_DIM, arr, arr+BLOCK_DIM);
+    prefix_scan_kogge_stone(BLOCK_DIM, arr);
 
     __syncthreads();
 
@@ -980,7 +867,7 @@ __global__ void SinglePass(int n, int *array, int *partial_sum, int *prefix_sum)
         else
             partial_sum[0] = 0;
 
-        partial_sum[scan_block_idx + 1] = partial_sum[scan_block_idx] + arr[2*BLOCK_DIM-1];
+        partial_sum[scan_block_idx + 1] = partial_sum[scan_block_idx] + arr[BLOCK_DIM-1];
         
         __threadfence();
         atomicAdd(&block_counter, 1);
@@ -989,8 +876,6 @@ __global__ void SinglePass(int n, int *array, int *partial_sum, int *prefix_sum)
 
     if (idx < n)
         prefix_sum[idx] = arr[threadIdx.x] + partial_sum[scan_block_idx];
-    if (idx + BLOCK_DIM < n)
-        prefix_sum[idx + BLOCK_DIM] = arr[threadIdx.x + BLOCK_DIM] + partial_sum[scan_block_idx];
 
     __syncthreads();
 }
@@ -1055,3 +940,105 @@ Assume there are K blocks. Then
 */
 
 // Further shared memory optimization: https://gemini.google.com/app/76e87e922ebb948f
+
+// Streaming processor (CUDA Core)
+// Cores in an SM are grouped further into processing blocks.
+// 1 Processing Block = 32 Cores = 1 Warp or it can have multiple warps
+
+/* 
+共容/互斥：__host__ 和 __device__ 可同时出现（生成 host+device 两个版本）；__global__ 与 __host__/__device__ 互斥。
+调用关系：host 不能调用 __device__；host 可以 <<<>>> 调 __global__；
+kernel 内可普通调用 __device__/__host__ __device__(device 版)。
+kernel 内不能把另一个 __global__ 当普通函数调用；只能用 child<<<>>> 做 device-side launch
+（需 Dynamic Parallelism + 相应编译/链接选项），并且 launch 有额外开销/同步语义。
+*/
+
+/*
+ * - CPU: optimized for sequential performance
+ *   - Large chip area for fast arithmetic (strong single-thread cores)
+ *   - Multi-level caches for low-latency data access
+ *   - tileSizeanch prediction, out-of-order execution, etc.
+ *
+ * - GPU: optimized for massive parallel throughput
+ *   - Very large number of cores/ALUs to run many threads concurrently
+ *   - Higher memory bandwidth (to feed many threads)
+ *
+ * - Host-side sync: after a kernel launch, call cudaDeviceSynchronize()
+ *   to block the CPU until the kernel finishes (and to surface async errors).
+ *
+ * - Block-level sync: __syncthreads() is an intrinsic barrier that
+ *   synchronizes all threads within the *same* thread block.
+ */
+
+#define BLOCK_DIM_X 8
+#define BLOCK_DIM_Y 8
+
+__device__ __forceinline__ double func(double x, double y)
+{
+  return x*x + y*y;
+}
+
+__global__ void compute_laplacian(int Nx, int Ny,
+    double xstart, double ystart, double dx, double dy, double *result)
+{
+  __shared__ double f[BLOCK_DIM_X][BLOCK_DIM_Y];
+
+  int i = threadIdx.x, j = threadIdx.y;
+  int nx = BLOCK_DIM_X - 2, ny = BLOCK_DIM_Y - 2;
+
+  int ix = (int)blockIdx.x * nx + i - 1;
+  int iy = (int)blockIdx.y * ny + j - 1;
+
+  double v = 0.0;
+  if (0 <= ix && ix < Nx && 0 <= iy && iy < Ny) {
+    double x = xstart + ix * dx;
+    double y = ystart + iy * dy;
+    v = func(x, y);
+  }
+  f[i][j] = v;
+  __syncthreads();
+
+  if (1 <= i && i <= nx && 1 <= j && j <= ny &&
+      1 <= ix && ix < Nx-1 && 1 <= iy && iy < Ny-1) {
+    result[ix * Ny + iy] =
+        (f[i-1][j] - 2.0*f[i][j] + f[i+1][j]) / (dx*dx) +
+        (f[i][j-1] - 2.0*f[i][j] + f[i][j+1]) / (dy*dy);
+  }
+}
+
+int laplacian_main()
+{
+  double xstart = -1.0, ystart = -1.0;
+  int Nx = 200, Ny = 400;
+
+  if (Nx < 3 || Ny < 3) return 1;
+
+  double dx = 2.0 / (Nx - 1);
+  double dy = 2.0 / (Ny - 1);
+
+  double *laplacian_d = NULL;
+  cudaMalloc(&laplacian_d, (size_t)Nx * (size_t)Ny * sizeof(double));
+  cudaMemset(laplacian_d, 0, (size_t)Nx * (size_t)Ny * sizeof(double));
+
+  dim3 dimBlock(BLOCK_DIM_X, BLOCK_DIM_Y);
+  int nx = BLOCK_DIM_X - 2, ny = BLOCK_DIM_Y - 2;
+  dim3 dimGrid((Nx + nx - 1) / nx, (Ny + ny - 1) / ny);
+
+  compute_laplacian<<<dimGrid, dimBlock>>>(Nx, Ny, xstart, ystart, dx, dy, laplacian_d);
+  cudaDeviceSynchronize();
+
+  double *laplacian = (double*)malloc((size_t)Nx * (size_t)Ny * sizeof(double));
+  cudaMemcpy(laplacian, laplacian_d,
+             (size_t)Nx * (size_t)Ny * sizeof(double),
+             cudaMemcpyDeviceToHost);
+
+  for (int i = 0; i < Nx; i++) {
+    for (int j = 0; j < Ny; j++)
+      printf("%lf\t", laplacian[i * Ny + j]);
+    printf("\n");
+  }
+
+  cudaFree(laplacian_d);
+  free(laplacian);
+  return 0;
+}
