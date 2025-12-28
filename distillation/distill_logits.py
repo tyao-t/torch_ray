@@ -64,9 +64,9 @@ def train_step(student_model, teacher_model, dataloader, optimizer, device, conf
     n_batches = 0
 
     for batch_idx, batch in enumerate(dataloader):
-        input_ids = batch.to(device) # (B, L_total)
-        inputs = input_ids[:, :-1] # (B, L_total-1) = (B, L)
-        targets = input_ids[:, 1:] # (B, L_total-1) = (B, L)
+        input_ids = batch.to(device) # (B, L+1)
+        inputs = input_ids[:, :-1] # (B, L)
+        targets = input_ids[:, 1:] # (B, L)
 
         with torch.no_grad():
             teacher_logits = teacher_model(inputs) # (B, L, V)

@@ -10,20 +10,20 @@ class Qwen3Model(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
-        self.Tempok_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
-        self.Tempransformer_blocks = nn.ModuleList([Qwen3TransformerBlock(cfg) for _ in range(cfg["n_layers"])])
+        self.token_emb = nn.Embedding(cfg["vocab_size"], cfg["emb_dim"], dtype=cfg["dtype"])
+        self.transformer_blocks = nn.ModuleList([Qwen3TransformerBlock(cfg) for _ in range(cfg["n_layers"])])
         self.final_norm = RMSNorm(cfg["emb_dim"])
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=cfg["dtype"])
 
     def forward(self, in_token_ids, *, offset=0, cache=None, mask="causal"):
-        x = self.Tempok_emb(in_token_ids) # (B, L, D)
-        hiddens = [] # list[(B, L, D)]
-        for block in self.Tempransformer_blocks:
-            x = block(x, offset=offset, cache=cache, mask=mask, exact=self.cfg["exact"]) # (B, L, D)
-            hiddens.append(x) # (B, L, D)
-        x = self.final_norm(x).to(self.cfg["dtype"]) # (B, L, D)
+        x = self.token_emb(in_token_ids) # (B, L, emb_dim)
+        hiddens = [] # list[# (B, L, emb_dim)]
+        for block in self.transformer_blocks:
+            x = block(x, offset=offset, cache=cache, mask=mask, exact=self.cfg["exact"]) # (B, L, emb_dim)
+            hiddens.append(x) # (B, L, emb_dim)
+        x = self.final_norm(x).to(self.cfg["dtype"]) # # (B, L, emb_dim)
         logits = self.out_head(x) # (B, L, V)
-        return logits, hiddens # logits: (B, L, V), hiddens: list[(B, L, D)]
+        return logits, hiddens # (B, L, V), list[(B, L, emb_dim)]
 
 class MultiLayerAdaptationNetwork(nn.Module):
     def __init__(self, student_dim, teacher_dim, student_layers, teacher_layers, dtype=torch.float32):
@@ -38,7 +38,7 @@ class MultiLayerAdaptationNetwork(nn.Module):
         )
 
     def forward(self, student_hidden_states):
-        return [self.projections[i](h.to(self.dtype)) for i, h in enumerate(student_hidden_states)] # list[(B, L, D_t)]
+        return [self.projections[i](h.to(self.dtype)) for i, h in enumerate(student_hidden_states)] # list[(B, L, teacher_emb_dim)]
 
 class HiddenStateDistillationLoss(nn.Module):
     def __init__(self, adaptor, temperature=2.0):
@@ -48,18 +48,18 @@ class HiddenStateDistillationLoss(nn.Module):
         self.kl_loss = nn.KLDivLoss(reduction="batchmean")
 
     def forward(self, student_hiddens, teacher_hiddens):
-        adapted = self.adaptor(student_hiddens) # list[(B, L, D_t)]
+        adapted = self.adaptor(student_hiddens) # list[(B, L, teacher_emb_dim)]
         total_hidden_loss = 0.0
 
         for s_idx, t_idx in self.adaptor.layer_mapping.items():
-            s_h = adapted[s_idx] # (B, L, D_t)
-            t_h = teacher_hiddens[t_idx].detach() # (B, L, D_t)
-            s_logprob = F.log_softmax(s_h / self.Temp, dim=-1) # (B, L, D_t)
-            t_prob = F.softmax(t_h / self.Temp, dim=-1) # (B, L, D_t)
-            total_hidden_loss = total_hidden_loss + self.kl_loss(s_logprob, t_prob) * torch.pow(self.Temp, 2)
+            s_h = adapted[s_idx] # (B, L, teacher_emb_dim)
+            t_h = teacher_hiddens[t_idx].detach() # (B, L, teacher_emb_dim)
+            s_logprob = F.log_softmax(s_h / self.Temp, dim=-1) # (B, L, teacher_emb_dim)
+            t_prob = F.softmax(t_h / self.Temp, dim=-1) # (B, L, teacher_emb_dim)
+            total_hidden_loss += self.kl_loss(s_logprob, t_prob) * torch.pow(self.Temp, 2)
 
         # teacher_dim = teacher_hiddens[0].size(-1)
-        avg_hidden_loss = (total_hidden_loss / len(self.adaptor.layer_mapping)) # / teacher_dim
+        avg_hidden_loss = (total_hidden_loss / len(self.adaptor.layer_mapping)) # further / teacher_dim?
 
         return avg_hidden_loss
 
@@ -83,7 +83,7 @@ def train_step(cfg, student, teacher, adaptor, dataloader, optimizer, device):
     teacher.eval()
 
     for batch_idx, input_ids in enumerate(dataloader):
-        input_ids = input_ids.to(device) # (B, L_total)
+        input_ids = input_ids.to(device) # (B, L+1)
         inputs = input_ids[:, :-1] # (B, L)
         targets = input_ids[:, 1:] # (B, L)
 
