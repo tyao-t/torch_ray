@@ -17,9 +17,9 @@ class GRPODataset(Dataset):
         return len(self.groups)
 
     def __getitem__(self, idx):
-        # Each __getitem__ returns ONE GRPO group:
+        # Each __getitem__ returns 1 GRPO group:
         # input_ids: (G, L) prompt+response, right-padded to max length within 1 grp
-        # mask: (G, L) 0=prompt+pad, 1=response tokens
+        # mask: (G, L) 1=response tokens, 0=prompt+pad
 
         # For simplicity, pad_token_id == eos_token_id == tokenizer.eos_token_id
         item = self.groups[idx]

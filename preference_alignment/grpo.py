@@ -5,7 +5,8 @@ import copy
 
 def compute_rho_per_token(policy_logprobs: torch.Tensor, # (B, L, V)
                           old_policy_logprobs: torch.Tensor, # (B, L, V)
-                          labels: torch.Tensor ) -> torch.Tensor: # Labels: (B, L) 0 for invalid tokens 1 for valid tokens
+                          labels: torch.Tensor) -> torch.Tensor: # Labels: (B, L) 0 for invalid tokens 1 for valid tokens
+    # Also note (by tianhao.yao), here B usually is G
     policy_logp = policy_logprobs.gather(
         dim=-1, index=labels.unsqueeze(-1)
     ).squeeze(-1) # (B, L)
@@ -14,7 +15,7 @@ def compute_rho_per_token(policy_logprobs: torch.Tensor, # (B, L, V)
         dim=-1, index=labels.unsqueeze(-1)
     ).squeeze(-1) # (B, L)
 
-    return torch.exp(policy_logp - old_logp)  # (B, L) # Policy Ratios
+    return torch.exp(policy_logp - old_logp) # (B, L) # Policy Ratios
 
 def compute_adv(rewards: torch.Tensor, # (G,)
                 eps: float = 1e-8) -> torch.Tensor:
@@ -44,8 +45,7 @@ def compute_grpo_loss(
     rho = compute_rho_per_token(policy_logprobs, old_logprobs, labels)  # (G, L)
 
     unclipped = rho * adv_tok  # (G, L)
-    clipped_rho = torch.clamp(rho, 1.0 - clip_eps, 1.0 + clip_eps)
-    clipped = clipped_rho * adv_tok
+    clipped = torch.clamp(rho, 1.0 - clip_eps, 1.0 + clip_eps) * adv_tok # clipped_rho * adv_tok
     surrogate = torch.minimum(unclipped, clipped)  # (G, L)
     
     m = completion_mask.to(surrogate.dtype)  # (G, L)
@@ -91,7 +91,6 @@ def grpo_train_fixed_ref(
     # input_ids: (G, T)
     # completion_mask: (G, T) aligned; completion=1 else 0
     # For simplicity, each batch == single group (same prompt, G completions)
-    # reference is fixed forever.
 
     policy = sft_policy.to(device)
     policy.train()

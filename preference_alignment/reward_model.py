@@ -35,8 +35,7 @@ class Qwen3RewardModel(nn.Module):
         cache: Optional[Any] = None,
         mask: str = "causal",
     ) -> torch.Tensor:
-        
-        x = self.tok_emb(input_ids) # (B, L, D_in)
+        x = self.tok_emb(input_ids) # (B, L, emb_dim)
 
         for block in self.transformer_blocks:
             x = block(
@@ -47,10 +46,10 @@ class Qwen3RewardModel(nn.Module):
                 exact=self.cfg.get("exact", False),
             )
 
-        h = self.final_norm(x).to(self.cfg["dtype"]) # (B, L, D_in)
+        h = self.final_norm(x).to(self.cfg["dtype"]) # (B, L, emb_dim)
         return self.reward_head(h) # (B, L, 1)
 
-def get_last_answer_token_reward(
+def get_last_answer_index_reward(
     all_rewards: torch.Tensor, # (B, L, 1)
     mask: torch.Tensor # (B, L, 1)
 ) -> torch.Tensor: # （B, )
@@ -90,15 +89,15 @@ def train_step(
     optimizer.zero_grad()
     
     c_ids = batch['chosen_input_ids'] # (B, L)
-    c_mask = batch['chosen_mask'].unsqueeze(-1) # 0=Answer, 1=Others, including padding (B, L, 1)
+    c_mask = batch['chosen_mask'].unsqueeze(-1) # 0=Model answer, 1=Others (prompt, padding), (B, L, 1)
     r_ids = batch['rejected_input_ids'] # (B, L)
-    r_mask = batch['rejected_mask'].unsqueeze(-1) # 0=Answer, 1=Others, including padding (B, L, 1)
+    r_mask = batch['rejected_mask'].unsqueeze(-1) # 0=Model answer, 1=Others, including padding (B, L, 1)
     
     c_full_rewards = model(c_ids, offset=0, kv_cache=None, mask="causal") # (B, L, 1)
-    c_final_score = get_last_answer_token_reward(c_full_rewards, c_mask) # (B, )
+    c_final_score = get_last_answer_index_reward(c_full_rewards, c_mask) # (B, )
     
     r_full_rewards = model(r_ids, offset=0, kv_cache=None, mask="causal")  # (B, L, 1)
-    r_final_score = get_last_answer_token_reward(r_full_rewards, r_mask) # (B, )
+    r_final_score = get_last_answer_index_reward(r_full_rewards, r_mask) # (B, )
     
     # Llama 2 uses a margin term m(y_c, y_r) based on rating difference
     margin = batch.get('margin', 0.0) if use_margin else 0.0

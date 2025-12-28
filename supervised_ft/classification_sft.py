@@ -4,7 +4,7 @@ from text_and_data.classification_sft_dataset import SpamDataset, classification
 from foundation.model import Qwen3Model
 from transformers import AutoTokenizer
 
-model = Qwen3Model({"""..."""})
+model = Qwen3Model({"":""})
 for param in model.parameters():
     param.requires_grad = False
 
@@ -23,11 +23,8 @@ def train_classifier_step(model, inputs, targets, last_indices, optimizer):
     
     all_logits = model(inputs) # (B, Classes)
     
-    """
-    高级索引
-    不能直接用 [:, last_indices, :]，那会取回 (B, B, Classes)
-    配合 torch.arange 来指定每一行的特定索引
-    """
+    # 不能直接用 [:, last_indices, :]，那会取回 (B, B, Classes)
+    # 配合 torch.arange 来指定每一行的特定索引
     batch_size = inputs.shape[0]
     logits = all_logits[torch.arange(batch_size), last_indices, :] # (B, Classes)
     

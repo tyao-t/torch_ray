@@ -15,15 +15,15 @@ def compute_ppo_clip_loss(
 
     policy_logprobs = policy_logprobs.gather(-1, actions_unsqueezed).squeeze(-1) # (B, L)
     old_log_probs = old_logprobs.gather(-1, actions_unsqueezed).squeeze(-1) # (B, L)
-    
+
     ratio = torch.exp(policy_logprobs - old_log_probs) # (B, L)
-    
+
     surr1 = ratio * advantages # (B, L)
     surr2 = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon) * advantages # (B, L)
     surrogate = torch.min(surr1, surr2) # (B, L)
-    
+
     m = mask.to(surrogate.dtype) # (B, L)
-    policy_loss = (-surrogate * m).sum() / m.sum().clamp(min=1.0) 
+    policy_loss = (-surrogate * m).sum() / m.sum().clamp(min=1.0)
     return policy_loss
 
 def compute_entropy_bonus(policy_logprobs: torch.Tensor, mask): # (B, L, V) and (B, L)
@@ -32,63 +32,64 @@ def compute_entropy_bonus(policy_logprobs: torch.Tensor, mask): # (B, L, V) and 
     p_log_p = probs * log_probs # (B, L, V)
     entropy_per_token = -torch.sum(p_log_p, dim=-1) # (B, L)
     m = mask.to(entropy_per_token.dtype) # (B, L)
-    bonus = (entropy_per_token * m).sum() / m.sum().clamp(min=1.0) 
+    bonus = (entropy_per_token * m).sum() / m.sum().clamp(min=1.0)
     return bonus
 
 def compute_value_targets(
     advantages: torch.Tensor, # (B, L)
-    old_values: torch.Tensor  # (B, L)
+    old_values: torch.Tensor # (B, L)
 ) -> torch.Tensor: # (B, L)
     targets = advantages + old_values
-    
+
     return targets.detach()
 
 def compute_value_loss(
     v_pred, # (B, L)
     v_target, # (B, L)
     mask,
-    clip_val_loss=False, 
+    clip_val_loss=False,
     v_old=None, # (B, L)
     clip_range_vf=0.2
-):    
+):
     if not clip_val_loss:
-        loss_vf = (v_pred - v_target).pow(2).mean() * 0.5
+        loss_vf = (v_pred - v_target).pow(2)
     else:
         loss_vf_unclipped = (v_pred - v_target).pow(2)
 
         v_pred_clipped = v_old + torch.clamp(
-            v_pred - v_old, 
-            -clip_range_vf, 
+            v_pred - v_old,
+            -clip_range_vf,
             clip_range_vf
         )
         loss_vf_clipped = (v_pred_clipped - v_target).pow(2)
-        
-        loss_vf = torch.max(loss_vf_unclipped, loss_vf_clipped).mean() * 0.5
-        
+
+        loss_vf = torch.max(loss_vf_unclipped, loss_vf_clipped)
+
+    loss_vf = loss_vf * 0.5
     m = mask.to(loss_vf.dtype) # (B, L)
     return (loss_vf * m).sum() / m.sum().clamp(min=1.0) # (B, L)
 
 def compute_ppo_rewards(
-    policy_logprobs: torch.Tensor,  # (B, L, V)
-    ref_logprobs: torch.Tensor,     # (B, L, V)
-    reward_scores: torch.Tensor,    # (B,)
-    actions: torch.Tensor,          # (B, L)
-    mask: torch.Tensor,             # (B, L) 0/1
+    policy_logprobs: torch.Tensor, # (B, L, V)
+    ref_logprobs: torch.Tensor, # (B, L, V)
+    reward_scores: torch.Tensor, # (B,)
+    actions: torch.Tensor, # (B, L)
+    mask: torch.Tensor, # (B, L) 0/1
     kl_beta: float = 0.1
-) -> torch.Tensor:                  # (B, L)
-    action_indices = actions.unsqueeze(-1)  # (B, L, 1)
+) -> torch.Tensor: # (B, L)
+    action_indices = actions.unsqueeze(-1) # (B, L, 1)
 
-    policy_lp = policy_logprobs.gather(dim=-1, index=action_indices).squeeze(-1)  # (B, L)
-    ref_lp = ref_logprobs.gather(dim=-1, index=action_indices).squeeze(-1)        # (B, L)
+    policy_lp = policy_logprobs.gather(dim=-1, index=action_indices).squeeze(-1) # (B, L)
+    ref_lp = ref_logprobs.gather(dim=-1, index=action_indices).squeeze(-1) # (B, L)
 
-    kl_div = kl_selected_tokens(policy_lp, ref_lp)  # (B, L)
-    rewards = -kl_beta * kl_div                     # (B, L)
+    kl_div = kl_selected_tokens(policy_lp, ref_lp) # (B, L)
+    rewards = -kl_beta * kl_div # (B, L)
 
     m = mask.to(rewards.dtype)
     rewards = rewards * m
 
-    lengths = m.sum(dim=1).long()                   # (B,), assumed >= 1
-    last_idx = lengths - 1                          # (B,)
+    lengths = m.sum(dim=1).long() # (B,), assumed >= 1
+    last_idx = lengths - 1 # (B,)
 
     b_idx = torch.arange(rewards.size(0), device=rewards.device)
     rewards[b_idx, last_idx] += reward_scores.to(rewards.dtype)
@@ -114,18 +115,18 @@ def compute_deltas(
     return deltas
 
 def compute_gae_advantages(
-    deltas: torch.Tensor,  # (B, L)
-    mask: torch.Tensor,    # (B, L), 0 = invalid, 1 = valid
+    deltas: torch.Tensor, # (B, L)
+    mask: torch.Tensor, # (B, L), 0 = invalid, 1 = valid
     gamma: float = 0.99,
     lam: float = 0.95
-) -> torch.Tensor:  # (B, L)
+) -> torch.Tensor: # (B, L)
     # A_t = (delta_t + gamma * lam * A_{t+1}) * mask_t
 
     B, L = deltas.shape
-    advantages = torch.zeros_like(deltas)  # (B, L)
+    advantages = torch.zeros_like(deltas) # (B, L)
 
-    m = mask.to(deltas.dtype)             # (B, L)
-    next_advantage = torch.zeros(B, device=deltas.device, dtype=deltas.dtype)  # (B,)
+    m = mask.to(deltas.dtype) # (B, L)
+    next_advantage = torch.zeros(B, device=deltas.device, dtype=deltas.dtype) # (B,)
 
     for t in reversed(range(L)):
         current_advantage = (deltas[:, t] + (gamma * lam) * next_advantage) * m[:, t]
@@ -167,7 +168,7 @@ def train_ppo_fixed_ref(
         ref_policy = copy.deepcopy(policy).to(device)
         freeze(ref_policy)
 
-    # Snapshot old models ONCE for this rollout-update
+    # Snapshot old models once for this rollout-update
     old_policy = copy.deepcopy(policy_model).to(device)
     freeze(old_policy)
 
@@ -196,26 +197,26 @@ def train_ppo_fixed_ref(
                     actions=labels,
                     mask=mask,
                     kl_beta=kl_coef
-                )  # (B, L)
+                ) # (B, L)
 
                 deltas = compute_deltas(
                     rewards=rewards,
                     values=old_values,
                     mask=mask,
                     gamma=gamma
-                )  # (B, L)
+                ) # (B, L)
 
                 advantages = compute_gae_advantages(
                     deltas=deltas,
                     mask=mask,
                     gamma=gamma,
                     lam=lam
-                )  # (B, L)
+                ) # (B, L)
 
                 returns = compute_value_targets(advantages, old_values) # (B, L)
 
-                # Normalize一下Advantage
-                m = mask.to(advantages.dtype)           # (B, L)
+                # Normalize一下Advantage，可选
+                m = mask.to(advantages.dtype) # (B, L)
                 valid = m > 0
                 valid_advs = advantages[valid]
                 advantages = (advantages - valid_advs.mean()) / valid_advs.std(unbiased=False).clamp(min=1e-8)

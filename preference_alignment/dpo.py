@@ -195,7 +195,6 @@ def train_model_dpo_simple(
     }
     tokens_seen, global_step = 0, -1
 
-    # Main training loop
     for epoch in range(num_epochs):
         policy.train()
 

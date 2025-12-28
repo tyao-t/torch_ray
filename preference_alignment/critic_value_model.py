@@ -4,7 +4,7 @@ from foundation.transformer_blocks import Qwen3TransformerBlock
 from foundation.operators.normalizations import RMSNorm
 
 # Sometimes, this Critic model share some or all transformers with the reward model.
-# For simplicty, we let them be completely separate models here
+# For simplicty, I let them be completely separate models here
 class Qwen3CriticModel(nn.Module):
     # Input: (B, L)
     # Output: (B, L, 1)

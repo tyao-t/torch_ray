@@ -64,7 +64,7 @@ def custom_collate_fn(
 
         for key in ["chosen", "rejected"]:
             sequence = item[key]
-            # Right padding Padding
+            # Right padding
             padded = sequence + [pad_token_id] * (max_length_common - len(sequence))
             mask = torch.ones(len(padded)).bool()
 
