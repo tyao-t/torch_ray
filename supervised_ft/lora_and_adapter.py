@@ -77,11 +77,11 @@ class LinearWithAdapter(nn.Module):
         return y + self.adapter(y)
 
 if __name__ == "__main__":
-    model = Qwen3Model({"..."})
+    model = Qwen3Model(dict())
     torch.manual_seed(23)
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total trainable parameters before: {total_params:,}")
-    # Total trainable parameters before: 124,441,346
+    # Total trainable parameters before: 10x millions or billions (e.g. 124,441,346)
 
     for param in model.parameters():
         param.requires_grad = False
@@ -94,6 +94,6 @@ if __name__ == "__main__":
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total trainable LoRA parameters: {total_params:,}")
-    # Total trainable LoRA parameters: 2,666,528
+    # Total trainable LoRA parameters: millions (e.g. 2,666,528)
 
     # Also, since we initialized matrix with 0's, we expect the initial model performance to be unchanged compared to before

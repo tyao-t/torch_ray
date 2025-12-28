@@ -4,7 +4,7 @@ from text_and_data.classification_sft_dataset import SpamDataset, classification
 from foundation.model import Qwen3Model
 from transformers import AutoTokenizer
 
-model = Qwen3Model({"":""})
+model = Qwen3Model(dict())
 for param in model.parameters():
     param.requires_grad = False
 
