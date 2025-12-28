@@ -34,28 +34,25 @@ def replace_linear_with_lora(model, rank, alpha):
             replace_linear_with_lora(module, rank, alpha)
 
 class AdapterLayer(nn.Module):
-    """
-    Adapter: x -> DownProject -> Activation -> UpProject -> (optionally scaled)
-    """
-    def __init__(self, in_features, adapter_size, activation=nn.GELU(), init_scale=1e-3, init_up="zero"):
-        """
-        init_up:
-        "zero": up_proj weights/biases are exactly 0 (Pfeiffer-style "no-op" at start)
-        "normal": up_proj weights ~ N(0, init_scale) so the adapter starts near-no-op but not exactly
-        """
+    # Adapter: x -> DownProj -> Activation -> UpProj -> (optional scale)
+    def __init__(self, in_features, adapter_size, activation=nn.GELU(), init_scale=1e-3, up_init="zero", scale_factor=None):
         super().__init__()
         self.down_proj = nn.Linear(in_features, adapter_size)
         self.up_proj = nn.Linear(adapter_size, in_features)
         self.activation = activation
+        if scale_factor is not None: # (By tianhao.yao's search): more canonical and optimal that Scale_factor is not an nn.Parameter
+            self.register_buffer('scale', torch.tensor(float(scale_factor)))
+        else:
+            self.scale = None
 
         with torch.no_grad():
-            nn.init.kaiming_uniform_(self.down_proj.weight, a=torch.sqrt(torch.tensor(5.0)))
+            nn.init.kaiming_uniform_(self.down_proj.weight, a=torch.sqrt(torch.Tensor(5)))
             nn.init.zeros_(self.down_proj.bias)
 
-            if init_up == "zero":
+            if up_init == "zero": #  up_proj weights/biases are exactly 0, Pfeiffer-style "no-op" at start
                 nn.init.zeros_(self.up_proj.weight)
                 nn.init.zeros_(self.up_proj.bias)
-            elif init_up == "normal":
+            elif up_init == "normal": # up_proj weights ~ N(0, init_scale) so the adapter starts near-no-op but not exactly
                 nn.init.normal_(self.up_proj.weight, mean=0.0, std=init_scale)
                 nn.init.zeros_(self.up_proj.bias)
 
@@ -63,6 +60,8 @@ class AdapterLayer(nn.Module):
         z = self.down_proj(x)
         z = self.activation(z)
         z = self.up_proj(z)
+        if self.scale is not None:
+            z = z * self.scale
         return z
 
 class LinearWithAdapter(nn.Module):
