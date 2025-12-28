@@ -69,7 +69,7 @@ class FullKvCache(KvCache):
 class BatchingKvCache(KvCache):
     def __init__(self, max_active_requests: int):
         self.max_active_requests = max_active_requests
-        self.kv_caches = [None] * max_active_requests
+        self.kv_caches: list[KvCache] = [None] * max_active_requests
         # Optimize Batching KV Cache: Paged Attention: https://chatgpt.com/share/693ef34f-adec-8003-87f4-c5e5d5a2c591
 
     def update_and_fetch_all(
@@ -79,8 +79,7 @@ class BatchingKvCache(KvCache):
         query_mask_len=None, # int | None 
         mask = None #torch.tensor | str | None
     ):
-        assert keys.shape == values.shape
-        batch_size, num_heads, N, head_dim = keys.shape
+        batch_size, num_heads, L_new, head_dim = keys.shape # L_new should be equal to query_mask_len
         assert batch_size == self.max_active_requests
 
         data = []
@@ -88,7 +87,7 @@ class BatchingKvCache(KvCache):
             if self.kv_caches[b] is None:
                 data.append(None)
                 continue
-            key, value = keys[b : b + 1], values[b : b + 1]
+            key, value = keys[b:b+1], values[b:b+1]
             new_key, new_value, seq_len, mask = self.kv_caches[b].update_and_fetch_all(
                 key, value
             )
@@ -103,14 +102,15 @@ class BatchingKvCache(KvCache):
             dtype=key.dtype,
             device=key.device
         )
+
+        offsets = [0] * batch_size
         for b in range(batch_size):
-            # if data[b] is None:
-            #     # for some reasons we need to do this, otherwise it will cause wrong output?
-            #     # maybe precision issues?
-            #     masks[b, :, :] = causal_mask(query_mask_len, max_seq_len, dtype=key.dtype)
-            #     continue
-            
+            if data[b] is None:
+                # masks[b, :, :] = causal_mask(query_mask_len, max_seq_len, dtype=key.dtype)
+                continue
+
             key, value, seq_len, mask = data[b]
+            offsets[b] = seq_len
             keys[b, :, max_seq_len - seq_len : max_seq_len, :] = key
             values[b, :, max_seq_len - seq_len : max_seq_len, :] = value
             
@@ -123,15 +123,15 @@ class BatchingKvCache(KvCache):
             elif isinstance(mask, torch.Tensor):
                 masks[b, :, max_seq_len - seq_len : max_seq_len] = mask
 
-        return keys, values, None, masks.reshape(batch_size, 1, query_mask_len, max_seq_len)
+        return keys, values, offsets, masks.reshape(batch_size, 1, query_mask_len, max_seq_len) # or expand, view might be ok?
 
-    def add_request(self, prefilled, id: int):
+    def add_request(self, prefilled_kv_cache: KvCache, id: int):
         assert id < self.max_active_requests
-        self.kv_caches[id] = prefilled
+        self.kv_caches[id] = prefilled_kv_cache
 
     def remove_request(self, id: int):
-        if self.kv_caches is None:
-            raise ValueError(f"Request id {id} is not in the cache")
+        # if self.kv_caches is None:
+        #     raise ValueError(f"Request id {id} is not in the cache")
         self.kv_caches[id] = None
 
 class RotatingKvCache(KvCache):
