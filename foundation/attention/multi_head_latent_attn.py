@@ -36,20 +36,20 @@ class MultiHeadLatentAttentionNaive(nn.Module):
         if kv_cache is None:
             latent_total = latenL_new
         else:
-            latent_total = kv_cache.update_and_fetch(latent_vector=latenL_new, rope_key=None, mask=mask) # torch.cat([self.cache_c_kv, latenL_new], dim=1)
+            latent_total, _, _, _ = kv_cache.update_and_fetch(latent_vector=latenL_new, rope_key=None, mask=mask)
 
         # keys_all = self.W_UK(latent_total)   # (batch, L_k_total, d_out)
         # values_all = self.W_UV(latent_total)   # (batch, L_k_total, d_out)
         keys_all, values_all = torch.chunk(self.W_UKV(latent_total), chunks=2, dim=-1)
 
         queries = queries_all.view(B, num_new_tokens, num_heads, head_dim).transpose(-2, -3)
-        keys = keys_all.view(B, keys_all.shape[1], num_heads, head_dim).transpose(-2, -3)
-        values = values_all.view(B, values_all.shape[1], num_heads, head_dim).transpose(-2, -3)
+        total_kv_tokens = keys_all.shape[-3]
+        keys = keys_all.view(B, total_kv_tokens, num_heads, head_dim).transpose(-2, -3)
+        values = values_all.view(B, total_kv_tokens, num_heads, head_dim).transpose(-2, -3)
 
         attn_scores = queries @ keys.transpose(-1, -2)
 
-        mask_bool = causal_mask(num_new_tokens, keys.shape[-2], device=queries.device)
-
+        mask_bool = causal_mask(num_new_tokens, total_kv_tokens, device=queries.device)
         attn_scores.masked_fill_(mask_bool, -torch.inf)
 
         attn_weights = torch.softmax(attn_scores * torch.rsqrt(keys.shape[-1]), dim=-1)
@@ -74,18 +74,17 @@ class DeepSeekV3LatentAttention(nn.Module):
         
         assert d_out % num_heads == 0
         self.head_dim = d_out // num_heads 
-        # self.dropout = nn.Dropout(dropout)
 
         self.W_DKV = nn.Linear(d_in, latent_dim, bias=qkv_bias)
         self.kv_norm = RMSNorm(latent_dim)
-
-        self.W_KR = nn.Linear(d_in, num_heads * rope_dim, bias=qkv_bias)
+        self.W_KRope = nn.Linear(d_in, num_heads * rope_dim, bias=qkv_bias)
 
         # Also note: DeepSeek V3 normally uses a larger latent dim for Q (e.g., 1536) than KV (512)
+        # Training Path, where we will also compress Q
         self.W_DQ = nn.Linear(d_in, latent_dim, bias=qkv_bias)
         self.q_norm = RMSNorm(latent_dim)
         self.W_UQ = nn.Linear(latent_dim, d_out, bias=False)
-        self.W_QR = nn.Linear(d_in, num_heads * rope_dim, bias=qkv_bias)
+        self.W_QRope = nn.Linear(d_in, num_heads * rope_dim, bias=qkv_bias)
 
         # Inference path, absorbed weight: W_DQ * W_UQ merged, W_QR concatenated
         self.W_Q = nn.Linear(d_in, d_out + num_heads * rope_dim, bias=qkv_bias)
@@ -108,13 +107,13 @@ class DeepSeekV3LatentAttention(nn.Module):
         
         c_kv = self.kv_norm(self.W_DKV(x)) # (B, L_new, latent_dim)
         
-        k_rope = self.W_KR(x).view(B, num_new_tokens, self.num_heads, self.rope_dim).transpose(-2, -3)
+        k_rope = self.W_KRope(x).view(B, num_new_tokens, self.num_heads, self.rope_dim).transpose(-2, -3)
         
         if self.training:
             q_latent = self.W_DQ(x) 
             q_latent = self.q_norm(q_latent) 
             q_content = self.W_UQ(q_latent).view(B, num_new_tokens, self.num_heads, self.head_dim).transpose(-2, -3)
-            q_rope = self.W_QR(x).view(B, num_new_tokens, self.num_heads, self.rope_dim).transpose(-2, -3)
+            q_rope = self.W_QRope(x).view(B, num_new_tokens, self.num_heads, self.rope_dim).transpose(-2, -3)
         else:
             # Inference: No latent/Norm step
             q_total = self.W_Q(x)
@@ -126,8 +125,6 @@ class DeepSeekV3LatentAttention(nn.Module):
         k_rope = apply_rotary_embedding(k_rope, self.cos, self.sin, offset=offset)
 
         if kv_cache is not None:
-            # We only pass latent_vector and rope_key
-
             # (B, total_kv_tokens, latent_dim), (B, num_heads, total_kv_tokens, rope_dim)
             c_kv_history, k_rope_history, _, _ = kv_cache.update_and_fetch(
                 latent_vector=c_kv, 
@@ -138,31 +135,29 @@ class DeepSeekV3LatentAttention(nn.Module):
             c_kv_history = c_kv
             k_rope_history = k_rope
 
-        
-        # A. Content Score (Absorbed Query @ Latent Cache)
+        # Content Score (Absorbed Query @ Latent Cache)
         # C @ (A @ B) ^ T = C @ B^T @ A^T
         w_uk = self.W_UK.weight.view(self.num_heads, self.head_dim, self.latent_dim)
 
-        # (B, H, N_q, D_h) @ (B, H, N_kv, D_h)^T 
+        # (B, H, N_q, D_h) @ (B, H, N_kv, D_h)^T
         # O(N_q * D_h * N_kv) + O(N_kv * D_h * D_l) vs O(N_q * D_h * D_l) + O(N_q * D_l * N_kv)
-        q_content_absorbed = torch.matmul(q_content, w_uk)
+        q_content_absorbed = torch.matmul(q_content, w_uk) # (B, num_heads, L_q, latent_dim)
 
-        score_content = q_content_absorbed @ c_kv_history.transpose(-1, -2).unsqueeze(1)
+        score_content = q_content_absorbed @ c_kv_history.unsqueeze(1).transpose(-1, -2) # (B, num_heads, L_q, total_kv_tokens)
 
-        # B. RoPE Score (Standard Query @ RoPE Cache)
-        score_rope = q_rope @ k_rope_history.transpose(-1, -2)
+        # RoPE Score (Standard Query @ RoPE Cache)
+        score_rope = q_rope @ k_rope_history.transpose(-1, -2) # Same shape as score_content
         
         scores = (score_content + score_rope) * torch.rsqrt(self.head_dim + self.rope_dim)
         
-        total_len = c_kv_history.shape[-2]
-        scores.masked_fill_(causal_mask(num_new_tokens, total_len, device=x.device), -torch.inf)
+        scores.masked_fill_(causal_mask(num_new_tokens, c_kv_history.shape[-2], device=x.device), -torch.inf)
         attn_weights = torch.softmax(scores, dim=-1) # self.dropout(torch.softmax(scores, dim=-1))
         
         # GATHER (Small Matrix Mult)
         # We use the weights to sum up the TINY latent vectors from history.
-        # attn_weights: (Batch, Heads, L_new, L_total)
+        # attn_weights: (Batch, num_heads, L_new, L_total)
         # c_kv_history: (Batch, L_total, latent_dim)
-        context_latent = torch.matmul(attn_weights, c_kv_history.unsqueeze(1)) # (Batch, Heads, L_new, latent_dim)
+        context_latent = torch.matmul(attn_weights, c_kv_history.unsqueeze(1)) # (Batch, num_heads, L_new, latent_dim)
 
         # O(L_new * L_total * Full_Dim + L_total * latent_dim * Full_dim) vs 
         # O(L_new * L_total * latent_dim + L_new * latent_dim * Full_dim)  
@@ -172,7 +167,7 @@ class DeepSeekV3LatentAttention(nn.Module):
         # We only do this for the 'new' tokens, not the entire history!
         w_uv_transposed = self.W_UV.weight.view(self.num_heads, self.head_dim, self.latent_dim).transpose(-1, -2)
         context_vec = torch.matmul(context_latent, w_uv_transposed)
-        # Result: (Batch, Heads, L_new, Head_Dim)
+        # Result: (Batch, num_heads, L_new, head_dim)
         
         context_vec = context_vec.transpose(-2, -3).contiguous().view(B, num_new_tokens, self.d_out)
         return self.out_proj(context_vec)

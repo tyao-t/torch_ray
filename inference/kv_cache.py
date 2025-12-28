@@ -170,33 +170,28 @@ class RotatingKvCache(KvCache):
 
 class MLAKVCache:
     def __init__(self):
-        # Shape: [Batch, Tokens, Latent_Dim]
-        self.latent_cache: Optional[torch.Tensor] = None 
-        
-        # Shape: [Batch, Heads, Tokens, Rope_Dim]
-        self.rope_cache: Optional[torch.Tensor] = None   
-        
+        self.latent_cache: Optional[torch.Tensor] = None # (B, L, latent_dim)
+        self.rope_cache: Optional[torch.Tensor] = None # (B, num_heads, L, rope_dim)  
         self.offset = 0
         
     def update_and_fetch(
         self,
-        latent_vector: torch.Tensor,             # [Batch, New_Tokens, Latent_Dim]
-        rope_key: Optional[torch.Tensor] = None, # [Batch, Heads, New_Tokens, Rope_Dim]
+        latent_vector: torch.Tensor, # (B, L_new, latent_dim)
+        rope_key: Optional[torch.Tensor] = None, # (B, num_heads, L_new, rope_dim)
         mask: torch.Tensor | str | None = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], int, Optional[torch.Tensor]]:
         
-        # Initialize on first pass
         if self.latent_cache is None:
             self.latent_cache = latent_vector
             self.rope_cache = rope_key
-            self.offset = latent_vector.shape[1] # num_new_tokens
+            self.offset = latent_vector.shape[-2] # num_new_tokens
         else:
-            self.latent_cache = torch.cat([self.latent_cache, latent_vector], dim=1)
+            self.latent_cache = torch.cat([self.latent_cache, latent_vector], dim=-2)
             
             if rope_key is not None:
-                self.rope_cache = torch.cat([self.rope_cache, rope_key], dim=2)
+                self.rope_cache = torch.cat([self.rope_cache, rope_key], dim=-2)
             
-            self.offset += latent_vector.shape[1]
+            self.offset += latent_vector.shape[-2]
             
         return self.latent_cache, self.rope_cache, self.offset, mask
 
@@ -209,9 +204,7 @@ class MLAKVCache:
             return
         
         self.offset -= n
-        
         self.latent_cache = self.latent_cache[:, :self.offset, :]
-        
         if self.rope_cache is not None:
             self.rope_cache = self.rope_cache[:, :, :self.offset, :]
 

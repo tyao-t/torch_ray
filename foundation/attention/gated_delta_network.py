@@ -79,19 +79,19 @@ class GatedDeltaNet(nn.Module):
         # self.conv_q = nn.Conv1d(d_out, d_out, kernel_size=conv_size, 
         #                         groups=d_out, padding=conv_size - 1) Same for conv_k conv_v
 
-        # Output Gate: 类似于 LSTM/GRU 的输出门，控制最终输出多少信息
+        # Output Gate 类似于 LSTM/GRU 的输出门，控制最终输出多少信息
         self.W_gate = nn.Linear(d_in, d_out, bias=False)
 
-        # Beta (Update Gate): 决定 "写入强度", (每个特征维度都有自己的 beta)
+        # Beta Update Gate 决定写入强度, 每个特征维度都有自己的 beta
         self.W_beta = nn.Linear(d_in, d_out, bias=False)
 
-        # Alpha (Decay Gate): 决定 "遗忘速度", 这里输出维度是 num_heads, 同一个 Head 里的所有特征共享同一个 alpha
+        # Alpha Decay Gate: 决定遗忘速度, 这里输出维度是 num_heads, 同一个 Head 里的所有特征共享同一个 alpha
         self.W_alpha = nn.Linear(d_in, num_heads, bias=False)
         self.dt_bias = nn.Parameter(torch.ones(num_heads))
 
-        # A 是 "Multi-Scale Memory" (多尺度记忆) 的关键, 形状是 (num_heads,)
-        # A 大的 Head：健忘，只看短期 (Short-term context)
-        # A 小的 Head：记性好，看长期 (Long-term context)
+        # A 是 Multi-Scale Memory 多尺度记忆 的关键, 形状是 (num_heads,)
+        # A 大的 Head：健忘，只看短期 Short-term context
+        # A 小的 Head：记性好，看长期 Long-term context
         A_init = torch.empty(num_heads).uniform_(0, 16)
         self.A_log = nn.Parameter(torch.log(A_init))
 
@@ -135,7 +135,7 @@ class GatedDeltaNet(nn.Module):
         outs = []
         for t in range(L):
             k_t = keys[:, :, t] # (B, heads, head_dim)
-            q_t = queries[:, :, t]  # (B, heads, head_dim)
+            q_t = queries[:, :, t] # (B, heads, head_dim)
             v_t = values[:, :, t] # (B, heads, head_dim)
             beta_t = beta[:, :, t] # (B, heads, head_dim)
 
@@ -143,13 +143,12 @@ class GatedDeltaNet(nn.Module):
 
             S = S * a_t # (B, heads, head_dim, head_dim)
 
-            # Retrieve (回忆), 当前的 key 去问 S 觉得现在的 value 应该是多少
+            # Retrieve, 当前的 key 去问 S 觉得现在的 value 应该是多少
             kv_mem = (S * k_t.unsqueeze(-1)).sum(dim=-2) # (B, heads, head_dim)
 
-            # Compute delta, 再乘 beta_t
             delta = (v_t - kv_mem) * beta_t # (B, heads, head_dim)
 
-            # 外积更新,修正S矩阵，k_t ⊗ delta
+            # 外积更新, 修正S矩阵，k_t ⊗ delta
             S = S + k_t.unsqueeze(-1) * delta.unsqueeze(-2)
 
             # Query 最新的记忆
