@@ -69,7 +69,7 @@ def step(model, tok_indices, offset, kv_cache, *, mask="causal", n_tokens=1, sam
 @torch.no_grad()
 def prefill(model, tok_indices, kv_cache, *, sampler=greedy_sampler):
     model.eval()
-    token = step(model, tok_indices, 0, kv_cache, sampler)
+    token = step(model, tok_indices, offset=0, kv_cache=kv_cache, sampler=sampler)
     offset = tok_indices.numel()
     return token, offset
 
@@ -90,15 +90,15 @@ def generate_with_kv_cache(model, tok_indices, max_new_tokens, sampler=greedy_sa
         # return tok_indices
 
 @torch.no_grad()
-def rewind_cache(kv_cache, rewind_len):
-    for layer in kv_cache: layer.rewind(rewind_len)
+def revert_cache(kv_cache, revert_len):
+    for layer in kv_cache: layer.revert(revert_len)
 
-# Speculative decoding
+# Below is Speculative decoding
 @torch.no_grad() # torch.inference_mode()
 def speculative_generate(draft_model, model, tok_indices, *, num_drafts=5):
     draft_kv_cache = [FullKvCache() for _ in range(len(draft_model.transformer_blocks))]
     kv_cache = [FullKvCache() for _ in range(len(model.transformer_blocks))]
-    # Same tokenizer for both models
+    # Need to assume same tokenizer for both models
     draft_model.eval()
     draft_token, draft_offset = prefill(
         draft_model, tok_indices, draft_kv_cache
@@ -120,7 +120,7 @@ def speculative_generate(draft_model, model, tok_indices, *, num_drafts=5):
     all_correct, advance_new_token = True, None
     while True:
         # Below is an extra optimization (by tianhao.yao) but commented out for readability 
-        # if all_correct and advance_new_token:
+        # if all_correct and advance_new_token is not None:
         #     input_tokens = torch.concat(draft_generated_tokens[...,-1], advance_new_token, dim=-1)
         #     tokens = step(draft_model, input_tokens, draft_offset, kv_cache, n_tokens=2)
         #     draft_offset += 2
@@ -150,22 +150,23 @@ def speculative_generate(draft_model, model, tok_indices, *, num_drafts=5):
 
         all_correct = True
         for i in range(num_drafts+1):
-            if new_tokens[0, i] != draft_generated_tokens[0, i]:
-                assert i >= 1
-                rewind_len = num_drafts - i
-                rewind_cache(draft_kv_cache, rewind_len)
-                draft_offset -= rewind_len
-                rewind_cache(kv_cache, rewind_len+1)
-                token = new_tokens[i] # (1, 1)
-                offset -= rewind_len+1
+            if new_tokens[0, i] == draft_generated_tokens[0, i]: continue 
+            
+            assert i >= 1
+            revert_len = num_drafts - i
+            revert_cache(draft_kv_cache, revert_len)
+            draft_offset -= revert_len
+            revert_cache(kv_cache, revert_len+1)
+            offset -= revert_len+1
 
-                assert offset == draft_offset
-                assert offset == kv_cache[0].offset
-                all_correct = False
-                break
+            all_correct = False
+            token = new_tokens[i] # (1, 1)
+            assert offset == draft_offset
+            assert offset == kv_cache[0].offset
+            break
 
         if not all_correct: continue 
-        draft_generate(draft_model, draft_generated_tokens[...,-1], draft_offset, draft_kv_cache, 1)
+        draft_generate(draft_model, draft_generated_tokens[...,-1:], draft_offset, draft_kv_cache, 1)
         token = advance_new_token
         draft_offset += 1
 

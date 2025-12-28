@@ -10,7 +10,6 @@ class MoEFeedForward(nn.Module):
         self.top_k = cfg.get("MOE_num_experts_per_token", 8)
         self.num_total_experts = cfg["MOE_num_total_experts"]
         self.emb_dim = cfg["emb_dim"]
-        self.hidden_dim = cfg["hidden_dim"]
 
         self.deepseek_style = (self.mode == "deepseek")
         if self.deepseek_style:
@@ -18,7 +17,7 @@ class MoEFeedForward(nn.Module):
 
         self.gate = nn.Linear(self.emb_dim, self.num_total_experts, bias=False)
         self.routed_experts = nn.ModuleList([
-            Qwen23FeedForward(self.emb_dim, self.hidden_dim)
+            Qwen23FeedForward(cfg)
             for _ in range(self.num_total_experts)
         ])
 
@@ -40,7 +39,7 @@ class MoEFeedForward(nn.Module):
             topk_scores, topk_indices = torch.topk(logits, self.top_k, dim=-1) #(B*L,k), (B*L,k)
             topk_weights = F.softmax(topk_scores, dim=-1) # (B * L, k)
         else:
-            x_norm = F.normalize(x_flat, p=2, dim=-1) #(B*L,dim)
+            x_norm = F.normalize(x_flat, p=2, dim=-1) #(B*L,emb_dim)
             gate_weight_norm = F.normalize(self.gate.weight, p=2, dim=-1) # (num_total_experts, emb_dim)
             logits = F.linear(x_norm, gate_weight_norm, self.gate.bias) # (B * L, num_total_experts)
             # logits_with_bias = logits + self.expert_bias
@@ -68,18 +67,18 @@ class MoEFeedForward(nn.Module):
             #
             #         # self.expert_bias.clamp_(-0.5, 0.5)
 
-        final_routed_output = torch.zeros_like(x_flat) #(B*L, dim)
+        final_routed_output = torch.zeros_like(x_flat) #(B*L, emb_dim)
         for expert_idx in range(self.num_total_experts):
             mask = (topk_indices == expert_idx) #(B*L, k)
             if not mask.any():
                 continue
 
             batch_indices, k_rank_indices = mask.nonzero(as_tuple=True) # (selected,) (selected,)
-            expert_input = x_flat[batch_indices, ...] #(selected, dim)
+            expert_input = x_flat[batch_indices, ...] #(selected, emb_dim)
             weights = topk_weights[..., batch_indices, k_rank_indices].unsqueeze(-1) #(selected, 1)
 
-            expert_output = self.routed_experts[expert_idx](expert_input) #(selected, dim)
-            final_routed_output.index_add_(0, batch_indices, expert_output * weights)
+            expert_output = self.routed_experts[expert_idx](expert_input) #(selected, emb_dim)
+            final_routed_output.index_add_(dim=0, index=batch_indices, source=expert_output*weights)
 
             """OLD
             token_mask = mask.any(dim=-1) (L,)
@@ -87,7 +86,7 @@ class MoEFeedForward(nn.Module):
             if selected_idx.numel() == 0:
                 continue
 
-            expert_input = x_flat.index_select(0, selected_idx)  # expert_input: (selected_tokens, dim)
+            expert_input = x_flat.index_select(0, selected_idx)  # expert_input: (selected_tokens, emb_dim)
 
             mask_selected = mask[selected_idx]  # mask_selected: (selected_tokens, k), k = top_k
             slot_indices = mask_selected.int().argmax(dim=-1, keepdim=True)  # slot_indices: (selected_tokens, 1)
@@ -100,11 +99,12 @@ class MoEFeedForward(nn.Module):
         total_output = final_routed_output + self.shared_expert(x_flat) \
             if self.deepseek_style else final_routed_output
 
-        # return total_output.contiguous().view(*x.shape[:-1], dim)
+        # return total_output.contiguous().view(*x.shape[:-1], emb_dim)
 
-        scores = scores.view(B, L, self.num_total_experts) # (B, L, num_total_experts)
-        probs_full = F.softmax(scores, dim=-1) # (B, L, num_total_experts)
-        gating_probs_scattered = torch.zeros_like(scores) # (B, L, num_total_experts)
+        # Aux Loss below
+        logits = logits.view(B, L, self.num_total_experts) # (B, L, num_total_experts)
+        probs_full = F.softmax(logits, dim=-1) # (B, L, num_total_experts)
+        gating_probs_scattered = torch.zeros_like(logits) # (B, L, num_total_experts)
         gating_probs_scattered.scatter_(dim=-1, index=topk_indices, src=topk_weights) # (B, L, num_total_experts)
 
         # importance: the average "probability mass" per expert (from probs_full; sums to 1 if computed over experts)
@@ -121,7 +121,7 @@ class MoEFeedForward(nn.Module):
             # load_raw = gating_probs_scattered.sum(dim=(0, 1)) # (num_total_experts,), sum=B*L
             # load = load_raw / (B * L) # (num_total_experts,), sum=1
         else:
-            dispatch_one_hot = torch.zeros_like(scores) #(B, L, num_total_experts)
+            dispatch_one_hot = torch.zeros_like(logits) #(B, L, num_total_experts)
             dispatch_one_hot.scatter_(dim=-1, index=topk_indices, src=torch.ones_like(topk_indices)) #(B*L, num_total_experts)
             # load = dispatch_one_hot.sum(dim=(0, 1)) / (B * L * self.top_k)  # (num_total_experts,), sum=1
             load = dispatch_one_hot.mean(dim=(0, 1)) / self.top_k
@@ -139,7 +139,7 @@ class MoEFeedForward(nn.Module):
         }
         return total_output.contiguous().view(*x.shape[:-1], dim) #, aux
 
-def get_total_moe_aux_loss(model):
+def get_total_moe_aux_loss(model: nn.Module):
     total_aux_loss = 0.0
     for module in model.modules():
         if isinstance(module, MoEFeedForward):

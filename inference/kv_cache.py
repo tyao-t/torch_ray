@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 
 class KvCache(ABC):
     @abstractmethod
-    def update_and_fetch(
+    def update_and_fetch_all(
         self,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -21,7 +21,7 @@ class FullKvCache(KvCache):
         self.values = None
         self.offset: int = 0
 
-    def update_and_fetch(
+    def update_and_fetch_all(
         self,
         key: torch.Tensor,
         value: torch.Tensor,
@@ -29,7 +29,7 @@ class FullKvCache(KvCache):
         mask: torch.Tensor | str | None = None,
     ) -> Tuple[torch.Tensor, torch.Tensor, int, Optional[torch.Tensor]]:
         
-        if self.key_values is None:
+        if self.keys is None:
             assert self.offset == 0
             self.keys, self.values = key, value
             batch_size, num_heads, num_tokens, head_dim = key.shape
@@ -49,7 +49,7 @@ class FullKvCache(KvCache):
             
             return self.keys, self.values, self.offset, mask
 
-    def rewind(self, n: int):
+    def revert(self, n: int):
         if n == 0 or self.keys is None:
             return
 
@@ -58,7 +58,7 @@ class FullKvCache(KvCache):
             return
         
         self.offset -= n
-        if self.key_values is not None:
+        if self.keys is not None:
             self.keys = self.keys[:, :, :self.offset, :]
             self.values = self.values[:, :, :self.offset, :]
 
@@ -72,7 +72,7 @@ class BatchingKvCache(KvCache):
         self.kv_caches = [None] * max_active_requests
         # Optimize Batching KV Cache: Paged Attention: https://chatgpt.com/share/693ef34f-adec-8003-87f4-c5e5d5a2c591
 
-    def update_and_fetch(
+    def update_and_fetch_all(
         self,
         keys,
         values,
@@ -89,7 +89,7 @@ class BatchingKvCache(KvCache):
                 data.append(None)
                 continue
             key, value = keys[b : b + 1], values[b : b + 1]
-            new_key, new_value, seq_len, mask = self.kv_caches[b].update_and_fetch(
+            new_key, new_value, seq_len, mask = self.kv_caches[b].update_and_fetch_all(
                 key, value
             )
             data.append((new_key[0], new_value[0], seq_len, mask))
@@ -141,7 +141,7 @@ class RotatingKvCache(KvCache):
         self.values = None
         self.capacity = capacity
 
-    def update_and_fetch(self, key, value, query_mask_len=None, mask=None):
+    def update_and_fetch_all(self, key, value, query_mask_len=None, mask=None):
         batch_size, num_heads, num_tokens, head_dim = key.shape
         assert num_tokens <= self.capacity 
 
@@ -174,7 +174,7 @@ class MLAKVCache:
         self.rope_cache: Optional[torch.Tensor] = None # (B, num_heads, L, rope_dim)  
         self.offset = 0
         
-    def update_and_fetch(
+    def update_and_fetch_all(
         self,
         latent_vector: torch.Tensor, # (B, L_new, latent_dim)
         rope_key: Optional[torch.Tensor] = None, # (B, num_heads, L_new, rope_dim)
@@ -195,7 +195,7 @@ class MLAKVCache:
             
         return self.latent_cache, self.rope_cache, self.offset, mask
 
-    def rewind(self, n: int):
+    def revert(self, n: int):
         if n == 0 or self.latent_cache is None:
             return
 

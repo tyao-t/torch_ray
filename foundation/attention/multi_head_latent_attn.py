@@ -36,7 +36,7 @@ class MultiHeadLatentAttentionNaive(nn.Module):
         if kv_cache is None:
             latent_total = latenL_new
         else:
-            latent_total, _, _, _ = kv_cache.update_and_fetch(latent_vector=latenL_new, rope_key=None, mask=mask)
+            latent_total, _, _, _ = kv_cache.update_and_fetch_all(latent_vector=latenL_new, rope_key=None, mask=mask)
 
         # keys_all = self.W_UK(latent_total)   # (batch, L_k_total, d_out)
         # values_all = self.W_UV(latent_total)   # (batch, L_k_total, d_out)
@@ -126,7 +126,7 @@ class DeepSeekV3LatentAttention(nn.Module):
 
         if kv_cache is not None:
             # (B, total_kv_tokens, latent_dim), (B, num_heads, total_kv_tokens, rope_dim)
-            c_kv_history, k_rope_history, _, _ = kv_cache.update_and_fetch(
+            c_kv_history, k_rope_history, _, _ = kv_cache.update_and_fetch_all(
                 latent_vector=c_kv, 
                 rope_key=k_rope,
                 mask=mask

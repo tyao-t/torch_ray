@@ -121,7 +121,7 @@ class GroupedQueryAttention(nn.Module):
             # values = values[:, :, None, :, :].expand(batch_size, num_groups, self.group_size, num_tokens, out_head_dim)
             # values = values.reshape(batch_size, self.num_heads, num_tokens, out_head_dim)
 
-        keys, values, _, mask = cache.update_and_fetch(
+        keys, values, _, mask = cache.update_and_fetch_all(
             keys, values, query_mask_len=num_tokens, mask=mask
         )
 
