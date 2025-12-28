@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from foundation.kullback_leibler_div import kl_full_distribution_torch
+from foundation.kullback_leibler_div import kl_full_distribution
 
 def configure_student_model(student_model: nn.Module, unfreeze_last_n_blocks: int = 2):
     for p in student_model.parameters():
@@ -34,17 +34,16 @@ class DistillationLoss(nn.Module):
 
         loss_ce = self.ce(
             student_logits.reshape(-1, V), # (B*L, V)
-            targets.reshape(-1), # (B*L,)
+            targets.flatten(), # (B*L,)
         )
 
-        t = self.Temp
-        logp_s = F.log_softmax(student_logits / t, dim=-1) # (B, L, V)
-        logp_t = F.log_softmax(teacher_logits / t, dim=-1) # (B, L, V)
+        logp_s = F.log_softmax(student_logits / self.Temp, dim=-1) # (B, L, V)
+        logp_t = F.log_softmax(teacher_logits / self.Temp, dim=-1) # (B, L, V)
 
-        loss_kd = kl_full_distribution_torch(
+        loss_kd = kl_full_distribution(
             log_probs_policy=logp_t, # (B, L, V)
             log_probs_ref=logp_s, # (B, L, V)
-        ).mean() * torch.pow(t, 2)
+        ).mean() * torch.pow(self.Temp, 2)
 
         total = self.alpha * loss_ce + (1.0 - self.alpha) * loss_kd
         return total, loss_ce, loss_kd

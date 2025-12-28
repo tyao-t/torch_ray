@@ -21,13 +21,13 @@ def kl_selected_tokens(
 
     return kl_val # * mask.to(kl_val.dtype)
 
-def kl_full_distribution_manual(log_probs_policy: torch.Tensor,
+def kl_full_distribution(log_probs_policy: torch.Tensor,
                                 log_probs_ref: torch.Tensor) -> torch.Tensor:
     # KL(π_policy || π_ref) = Σ_v π_policy(v) * (log π_policy(v) - log π_ref(v))
     probs_policy = log_probs_policy.exp()  # (B, L, V)
     return (probs_policy * (log_probs_policy - log_probs_ref)).sum(dim=-1)  # (B L)
 
-def kl_full_distribution_torch(log_probs_policy: torch.Tensor,
+def kl_full_distribution(log_probs_policy: torch.Tensor,
                                log_probs_ref: torch.Tensor) -> torch.Tensor:
     probs_policy = log_probs_policy.exp()
 
