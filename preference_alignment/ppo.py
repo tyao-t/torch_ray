@@ -3,7 +3,9 @@ import torch.nn.functional as F
 from foundation.kullback_leibler_div import kl_selected_tokens
 import copy
 
-def compute_ppo_clip_loss(
+from grpo import compute_rho_per_token
+
+def compute_ppo_clipped_policy_loss(
     policy_logprobs, # (B, L, V)
     old_logprobs, # (B, L, V)
     advantages, # (B, L)
@@ -11,15 +13,14 @@ def compute_ppo_clip_loss(
     mask, # (B, L)
     epsilon=0.2
 ):
+    # rho = compute_rho_per_token(policy_logprobs, old_logprobs, actions) # (B, L)
     actions_unsqueezed = actions.unsqueeze(-1) # (B, L, 1)
-
     policy_logprobs = policy_logprobs.gather(-1, actions_unsqueezed).squeeze(-1) # (B, L)
     old_log_probs = old_logprobs.gather(-1, actions_unsqueezed).squeeze(-1) # (B, L)
+    rho = torch.exp(policy_logprobs - old_log_probs) # (B, L)
 
-    ratio = torch.exp(policy_logprobs - old_log_probs) # (B, L)
-
-    surr1 = ratio * advantages # (B, L)
-    surr2 = torch.clamp(ratio, 1.0 - epsilon, 1.0 + epsilon) * advantages # (B, L)
+    surr1 = rho * advantages # (B, L)
+    surr2 = torch.clamp(rho, 1.0 - epsilon, 1.0 + epsilon) * advantages # (B, L)
     surrogate = torch.min(surr1, surr2) # (B, L)
 
     m = mask.to(surrogate.dtype) # (B, L)
@@ -27,9 +28,9 @@ def compute_ppo_clip_loss(
     return policy_loss
 
 def compute_entropy_bonus(policy_logprobs: torch.Tensor, mask): # (B, L, V) and (B, L)
-    log_probs = F.log_softmax(policy_logprobs, dim=-1) # (B, L, V)
-    probs = torch.exp(log_probs) # (B, L, V)
-    p_log_p = probs * log_probs # (B, L, V)
+    # log_probs = F.log_softmax(policy_logits, dim=-1) # (B, L, V)
+    probs = torch.exp(policy_logprobs) # (B, L, V)
+    p_log_p = probs * policy_logprobs # (B, L, V)
     entropy_per_token = -torch.sum(p_log_p, dim=-1) # (B, L)
     m = mask.to(entropy_per_token.dtype) # (B, L)
     bonus = (entropy_per_token * m).sum() / m.sum().clamp(min=1.0)
@@ -51,7 +52,7 @@ def compute_value_loss(
     v_old=None, # (B, L)
     clip_range_vf=0.2
 ):
-    if not clip_val_loss:
+    if not clip_val_loss or v_old is None:
         loss_vf = (v_pred - v_target).pow(2)
     else:
         loss_vf_unclipped = (v_pred - v_target).pow(2)
@@ -77,21 +78,20 @@ def compute_ppo_rewards(
     mask: torch.Tensor, # (B, L) 0/1
     kl_beta: float = 0.1
 ) -> torch.Tensor: # (B, L)
-    action_indices = actions.unsqueeze(-1) # (B, L, 1)
+    # action_indices = actions.unsqueeze(-1) # (B, L, 1)
+    # policy_lp_labels = policy_logprobs.gather(dim=-1, index=action_indices).squeeze(-1) # (B, L)
+    # ref_lp_labels = ref_logprobs.gather(dim=-1, index=action_indices).squeeze(-1) # (B, L)
 
-    policy_lp = policy_logprobs.gather(dim=-1, index=action_indices).squeeze(-1) # (B, L)
-    ref_lp = ref_logprobs.gather(dim=-1, index=action_indices).squeeze(-1) # (B, L)
-
-    kl_div = kl_selected_tokens(policy_lp, ref_lp) # (B, L)
+    kl_div = kl_selected_tokens(policy_logprobs, ref_logprobs, actions) # (B, L)
     rewards = -kl_beta * kl_div # (B, L)
 
     m = mask.to(rewards.dtype)
     rewards = rewards * m
 
-    lengths = m.sum(dim=1).long() # (B,), assumed >= 1
-    last_idx = lengths - 1 # (B,)
+    indices = torch.arange(m.shape[1], device=m.device) # (B, L)
+    last_idx = (m * indices).argmax(dim=-1) # (B,)
 
-    b_idx = torch.arange(rewards.size(0), device=rewards.device)
+    b_idx = torch.arange(rewards.shape[0], device=rewards.device)
     rewards[b_idx, last_idx] += reward_scores.to(rewards.dtype)
 
     return rewards # (B, L)
@@ -109,6 +109,10 @@ def compute_deltas(
     # shift V_{t+1} and if next token is invalid, treat V_{t+1} as 0
     next_values = torch.cat([values[:, 1:], torch.zeros_like(values[:, :1])], dim=1)
     next_m = torch.cat([m[:, 1:], torch.zeros_like(m[:, :1])], dim=1)
+    # next_values = torch.roll(values, shifts=-1, dims=1)
+    # next_values[:, -1] = 0
+    # next_m = torch.zeros_like(m)
+    # next_m[:, :-1] = m[:, 1:]
     next_values = next_values * next_m
 
     deltas = (rewards + gamma * next_values - values) * m
@@ -130,6 +134,7 @@ def compute_gae_advantages(
 
     for t in reversed(range(L)):
         current_advantage = (deltas[:, t] + (gamma * lam) * next_advantage) * m[:, t]
+        # 反正这些是放在Torch.no_grad()下计算的，就暂先不detach了
         advantages[:, t] = current_advantage
         next_advantage = current_advantage
 
@@ -232,7 +237,7 @@ def train_ppo_fixed_ref(
             policy_logprobs = torch.log_softmax(policy(input_ids), dim=-1) # (B, L, V)
             new_values = value_model(input_ids).squeeze(-1) # (B, L)
 
-            loss_policy = compute_ppo_clip_loss(
+            loss_policy = compute_ppo_clipped_policy_loss(
                 policy_logprobs=policy_logprobs,
                 old_logprobs=old_logprobs,
                 advantages=advantages,
