@@ -201,3 +201,49 @@ def speculative_generate(draft_model, model, tok_indices, *, num_drafts=5):
 # # [["I"], ..., ["I am very happy to"], ["I am very happy to see"], ["I am very happy to see you"]]
 
 # [..., 0.9, 0.95, 0.3]
+
+@torch.no_grad() # torch.inference_mode()
+def avg_logprob_answer(model, tokenizer, prompt, answer, device="cpu"):
+    prompt_ids = tokenizer.encode(prompt) # python list[int], length == L_p
+    answer_ids = tokenizer.encode(answer) # python list[int], length == L_a
+    full_ids = torch.tensor(prompt_ids + answer_ids,
+                            device=device, dtype=torch.long) # (L,) L = L_p + L_a
+
+    full_ids_batched = full_ids.unsqueeze(0) # (B, L) B == 1
+
+    logits = model(full_ids_batched) # (B, L, V)
+    logits = logits.squeeze(0) # (L, V)
+
+    logprobs = torch.log_softmax(logits, dim=-1) # (L, V)
+
+    start = len(prompt_ids) - 1 
+    end = full_ids.shape[0] - 1 # == L-1
+
+    t_idx = torch.arange(start, end, device=device) # (L_a,)
+    next_tokens = full_ids[start + 1 : end + 1] # (L_a,)
+
+    next_token_logps = logprobs[t_idx, next_tokens] # (L_a,) advanced indexing of (t_idx[i], next_tokens[i])
+
+    return next_token_logps.mean().item()
+
+@torch.no_grad()
+def avg_logprob_masked(model, 
+                       input_ids, mask, # Both L
+                       device):
+    input_ids = torch.as_tensor(input_ids, device=device, dtype=torch.long) # (L,)
+    mask = torch.as_tensor(mask, device=device) # (L,) with values
+
+    input_ids_batched = input_ids.unsqueeze(0) # (B, L) B==1
+
+    logits = model(input_ids_batched) # (B, L, V)
+    logits = logits.squeeze(0) # (L, V)
+
+    logprobs = torch.log_softmax(logits, dim=-1) # (L, V)
+
+    pos = torch.nonzero(mask == 1, as_tuple=False).squeeze(1) # (L_m, 1)
+    pos = pos.squeeze(-1) # (L_m, 1)
+    pos = pos[pos < input_ids.shape[0]] # (L_m',) L_m' might be == L_m or == L_m-1
+    tok = input_ids[pos+1] # (L_m',)
+    selected_logps = logprobs[pos+1, tok] # (L_m',)
+
+    return torch.mean(selected_logps).item()
