@@ -8,7 +8,7 @@ from transformers import AutoTokenizer
 # @find_executable_batch_size(starting_batch_size=512, auto_find_batch_size=True)
 # @auto_find_executable_batch_size(starting_batch_size=512)
 def train_model(model, train_loader_wo_batch_size, val_loader_wo_batch_size, 
-                optimizer, device, *, batch_size, tokenzier, warmup_steps=10, n_epochs=5, 
+                optimizer, device, *, batch_size, tokenizer, warmup_steps=10, n_epochs=5, 
                 eval_freq=10, eval_iter=1, initial_lr=3e-05, min_lr=1e-6, ctx=None):
     train_loader, val_loader = train_loader_wo_batch_size(batch_size), \
         val_loader_wo_batch_size(batch_size)

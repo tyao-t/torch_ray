@@ -2,8 +2,8 @@ import torch
 import torch.nn.functional as F
 
 def softmax(x, dim=-1):
-    x_max = x.max(dim=dim, keepdim=True).values
-    x_exp = (x - x_max).exp()
+    x_max = torch.max(x, dim=-1, keepdim=True).values
+    x_exp = torch.exp(x - x_max)
     return x_exp / x_exp.sum(dim=dim, keepdim=True)
 
 def softmax(x, **kwargs):

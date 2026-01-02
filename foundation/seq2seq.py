@@ -55,24 +55,28 @@ class DecoderLayer(nn.Module):
         x = self.norm_3(x)
 
         return x
-class SinusoidalAbsolutePositionalEncoder(nn.Module): # 2017, in Attention is all you need paper (Added by tianhao.yao)
+class SinusoidalAbsolutePositionalEncoder(nn.Module):
     def __init__(self, emb_dim, max_seq_len=2048, dropout=0.1):
         super().__init__()
-        self.emb_dim = emb_dim
-        self.dropout = nn.Dropout(p=dropout)
-
-        pe = torch.zeros(max_seq_len, emb_dim)
-        position = torch.arange(0, max_seq_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, emb_dim, 2).float() * (-torch.log(10000.0) / emb_dim))
-
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
+        assert emb_dim % 2 == 0, "emb_dim must be even"
+        self.dropout = nn.Dropout(dropout)
+        half_dim = emb_dim // 2
+        inner = torch.arange(half_dim, dtype=torch.float32) / half_dim # (half_dim,)
+        inv_freqs = torch.pow(10000, -inner) # (half_dim,)
+        positions = torch.arange(max_seq_len, dtype=torch.float32) # (max_len,)
         
-        self.register_buffer('pe', pe.unsqueeze(0))
+        angles = torch.outer(positions, inv_freqs) # (max_len, half_dim)
+        
+        sin_vals = torch.sin(angles) # (max_len, half_dim)
+        cos_vals = torch.cos(angles) # (max_len, half_dim)
+        
+        pe = torch.stack([sin_vals, cos_vals], dim=-1).reshape(max_seq_len, emb_dim) # (max_len, 2)        
+        self.register_buffer("pe", pe, persistent=False)
 
     def forward(self, x):
-        x = x * torch.sqrt(self.emb_dim)
-        x = x + self.pe[:, :x.size(1)]
+        B, L, D = x.shape
+        # x = x * torch.sqrt(self.emb_dim)
+        x = x + self.pe[:L, :]
         return self.dropout(x)
 
 class Encoder(nn.Module):

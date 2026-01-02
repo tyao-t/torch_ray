@@ -11,7 +11,7 @@ class LayerNorm(nn.Module):
     def forward(self, x):
         mean = x.mean(dim=-1, keepdim=True)
         # var = x.var(dim=-1, keepdim=True, correction=0) # unbiased=False
-        mean_square = torch.mean(torch.pow(x, 2), dim=-1, keepdim=True)
+        mean_square = torch.pow(x, 2)
         norm_x = (x - mean) * torch.rsqrt((mean_square-torch.pow(mean, 2)) + self.eps)
 
         norm_x = norm_x * self.scale
