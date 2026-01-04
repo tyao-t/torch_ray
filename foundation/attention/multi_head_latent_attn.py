@@ -135,7 +135,6 @@ class DeepSeekV3LatentAttention(nn.Module):
             c_kv_history = c_kv
             k_rope_history = k_rope
 
-        # Content Score (Absorbed Query @ Latent Cache)
         # C @ (A @ B) ^ T = C @ B^T @ A^T
         w_uk = self.W_UK.weight.view(self.num_heads, self.head_dim, self.latent_dim)
 
@@ -145,7 +144,6 @@ class DeepSeekV3LatentAttention(nn.Module):
 
         score_content = q_content_absorbed @ c_kv_history.unsqueeze(1).transpose(-1, -2) # (B, num_heads, L_q, total_kv_tokens)
 
-        # RoPE Score (Standard Query @ RoPE Cache)
         score_rope = q_rope @ k_rope_history.transpose(-1, -2) # Same shape as score_content
         
         scores = (score_content + score_rope) * torch.rsqrt(self.head_dim + self.rope_dim)
@@ -153,21 +151,14 @@ class DeepSeekV3LatentAttention(nn.Module):
         scores.masked_fill_(causal_mask(num_new_tokens, c_kv_history.shape[-2], device=x.device), -torch.inf)
         attn_weights = torch.softmax(scores, dim=-1) # self.dropout(torch.softmax(scores, dim=-1))
         
-        # GATHER (Small Matrix Mult)
-        # We use the weights to sum up the TINY latent vectors from history.
-        # attn_weights: (Batch, num_heads, L_new, L_total)
-        # c_kv_history: (Batch, L_total, latent_dim)
-        context_latent = torch.matmul(attn_weights, c_kv_history.unsqueeze(1)) # (Batch, num_heads, L_new, latent_dim)
+        context_latent = torch.matmul(attn_weights, c_kv_history.unsqueeze(1)) # (B, num_heads, L_new, latent_dim)
 
         # O(L_new * L_total * Full_Dim + L_total * latent_dim * Full_dim) vs 
         # O(L_new * L_total * latent_dim + L_new * latent_dim * Full_dim)  
 
-        # PROJECT UP (Deferred Weight Application)
-        # Now that we have the summed latent vector, we project it UP to the full head dimension.
-        # We only do this for the 'new' tokens, not the entire history!
         w_uv_transposed = self.W_UV.weight.view(self.num_heads, self.head_dim, self.latent_dim).transpose(-1, -2)
         context_vec = torch.matmul(context_latent, w_uv_transposed)
-        # Result: (Batch, num_heads, L_new, head_dim)
+        # Result: (B, num_heads, L_new, head_dim)
         
         context_vec = context_vec.transpose(-2, -3).contiguous().view(B, num_new_tokens, self.d_out)
         return self.out_proj(context_vec)
