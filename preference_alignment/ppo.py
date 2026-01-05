@@ -25,6 +25,11 @@ def compute_ppo_clipped_policy_loss(
 
     m = mask.to(surrogate.dtype) # (B, L)
     policy_loss = (-surrogate * m).sum() / m.sum().clamp(min=1.0)
+
+    # Added by tianhao.yao： 避免长回复主导梯度，或可先在样本内部求平均，再对样本求平均
+    # per_sample_loss = (-surrogate * m).sum(dim=1) / m.sum(dim=1) # (B,)
+    # policy_loss = per_sample_loss.mean()
+
     return policy_loss
 
 def compute_entropy_bonus(policy_logprobs: torch.Tensor, mask): # (B, L, V) and (B, L)

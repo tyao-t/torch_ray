@@ -51,7 +51,11 @@ def compute_grpo_loss(
     m = completion_mask.to(surrogate.dtype)  # (G, L)
     denom = m.sum().clamp(min=1.0) 
     policy_loss = (-surrogate * m).sum() / denom
-    
+
+    # Added by tianhao.yao: 避免长回复主导梯度，或可先在样本内部求平均，再对样本求平均
+    # per_sample_loss = (-surrogate * m).sum(dim=1) / m.sum(dim=1) # (G,)
+    # policy_loss = per_sample_loss.mean()
+
     # KL ≈ E_{a~pi_theta}[ log pi_theta(a|s) - log pi_ref(a|s) ]
 
     kl_per_token = kl_selected_tokens(
