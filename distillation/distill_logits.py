@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from foundation.kullback_leibler_div import kl_full_distribution
+from inference.generate import generate_text_simple
 
 def configure_student_model(student_model: nn.Module, unfreeze_last_n_blocks: int = 2):
     for p in student_model.parameters():
@@ -33,7 +34,7 @@ class DistillationLoss(nn.Module):
         B, L, V = student_logits.shape
 
         loss_ce = self.ce(
-            student_logits.reshape(-1, V), # (B*L, V)
+            student_logits.reshape(-1, V), # (B*L, V) student_logits.flatten(0, 1)
             targets.flatten(), # (B*L,)
         )
 
@@ -48,12 +49,11 @@ class DistillationLoss(nn.Module):
         total = self.alpha * loss_ce + (1.0 - self.alpha) * loss_kd
         return total, loss_ce, loss_kd
 
-
-def train_step(student_model, teacher_model, dataloader, optimizer, device, config):
+def train_step(student_model, teacher_model, dataloader, optimizer, device, cfg):
     criterion = DistillationLoss(
-        temperature=config["temperature"],
-        alpha=config["alpha"],
-        ignore_index=config.get("ignore_index", -100),
+        temperature=cfg["temperature"],
+        alpha=cfg["alpha"],
+        ignore_index=cfg.get("ignore_index", -100),
     )
 
     student_model.train()
@@ -65,12 +65,21 @@ def train_step(student_model, teacher_model, dataloader, optimizer, device, conf
     for batch_idx, batch in enumerate(dataloader):
         input_ids = batch.to(device) # (B, L+1)
         inputs = input_ids[:, :-1] # (B, L)
-        targets = input_ids[:, 1:] # (B, L)
+        
+        full_sequence = generate_text_simple(
+            teacher_model,
+            inputs,
+            max_new_tokens=cfg.get("gen_tokens", 5),
+            context_size=cfg.get("context_size", 1024)
+        )
+        
+        inputs = full_sequence[:, :-1] # (B, L+gen)
+        targets = full_sequence[:, 1:] # (B, L+gen)
 
         with torch.no_grad():
-            teacher_logits = teacher_model(inputs) # (B, L, V)
+            teacher_logits = teacher_model(inputs) # (B, L+gen, V)
 
-        student_logits = student_model(inputs) # (B, L, V)
+        student_logits = student_model(inputs) # (B, L+gen, V)
 
         loss, loss_ce, loss_kd = criterion(student_logits, teacher_logits, targets)
 

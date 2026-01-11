@@ -4,8 +4,9 @@ import torch.nn.functional as F
 
 from foundation.operators.normalizations import RMSNorm
 from foundation.transformer_blocks import Qwen3TransformerBlock
+from foundation.kullback_leibler_div import kl_full_distribution
+from inference.generate import generate_text_simple
 from distillation.distill_logits import DistillationLoss
-
 class Qwen3Model(nn.Module):
     def __init__(self, cfg):
         super().__init__()
@@ -45,7 +46,6 @@ class HiddenStateDistillationLoss(nn.Module):
         super().__init__()
         self.adaptor = adaptor
         self.Temp = float(temperature)
-        self.kl_loss = nn.KLDivLoss(reduction="batchmean")
 
     def forward(self, student_hiddens, teacher_hiddens):
         adapted = self.adaptor(student_hiddens) # list[(B, L, teacher_emb_dim)]
@@ -54,9 +54,9 @@ class HiddenStateDistillationLoss(nn.Module):
         for s_idx, t_idx in self.adaptor.layer_mapping.items():
             s_h = adapted[s_idx] # (B, L, teacher_emb_dim)
             t_h = teacher_hiddens[t_idx].detach() # (B, L, teacher_emb_dim)
-            s_logprob = F.log_softmax(s_h / self.Temp, dim=-1) # (B, L, teacher_emb_dim)
-            t_prob = F.softmax(t_h / self.Temp, dim=-1) # (B, L, teacher_emb_dim)
-            total_hidden_loss += self.kl_loss(s_logprob, t_prob) * torch.pow(self.Temp, 2)
+            logprob_s = F.log_softmax(s_h / self.Temp, dim=-1) # (B, L, teacher_emb_dim)
+            logprob_t = F.softmax(t_h / self.Temp, dim=-1) # (B, L, teacher_emb_dim)
+            total_hidden_loss += kl_full_distribution(logprob_t, logprob_s).mean() * torch.pow(self.Temp, 2)
 
         # teacher_dim = teacher_hiddens[0].size(-1)
         avg_hidden_loss = (total_hidden_loss / len(self.adaptor.layer_mapping)) # further / teacher_dim?
@@ -82,15 +82,24 @@ def train_step(cfg, student, teacher, adaptor, dataloader, optimizer, device):
     adaptor.train()
     teacher.eval()
 
-    for batch_idx, input_ids in enumerate(dataloader):
-        input_ids = input_ids.to(device) # (B, L+1)
+    for batch_idx, batch in enumerate(dataloader):
+        input_ids = batch.to(device) # (B, L+1)
         inputs = input_ids[:, :-1] # (B, L)
-        targets = input_ids[:, 1:] # (B, L)
+        
+        full_sequence = generate_text_simple(
+            teacher, 
+            inputs, 
+            max_new_tokens=cfg.get("gen_tokens", 5), 
+            context_size=cfg.get("context_size", 1024)
+        )
+        
+        inputs = full_sequence[:, :-1] # (B, L+gen)
+        targets = full_sequence[:, 1:] # (B, L+gen)
 
         with torch.no_grad():
-            teacher_logits, teacher_hiddens = teacher(inputs) # teacher_logits: (B, L, V)
+            teacher_logits, teacher_hiddens = teacher(inputs) # teacher_logits: (B, L+gen, V)
 
-        student_logits, student_hiddens = student(inputs) # student_logits: (B, L, V)
+        student_logits, student_hiddens = student(inputs) # student_logits: (B, L+gen, V)
 
         hid_loss = criterion1(student_hiddens, teacher_hiddens)
         loss2, ce2, kd = criterion2(student_logits, teacher_logits, targets)

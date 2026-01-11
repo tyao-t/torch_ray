@@ -24,18 +24,18 @@ def kl_selected_tokens(
 def kl_full_distribution(log_probs_policy: torch.Tensor,
                                 log_probs_ref: torch.Tensor) -> torch.Tensor:
     # KL(π_policy || π_ref) = Σ_v π_policy(v) * (log π_policy(v) - log π_ref(v))
-    probs_policy = log_probs_policy.exp()  # (B, L, V)
-    return (probs_policy * (log_probs_policy - log_probs_ref)).sum(dim=-1)  # (B L)
+    probs_policy = log_probs_policy.exp() # (B, L, V)
+    return (probs_policy * (log_probs_policy - log_probs_ref)).sum(dim=-1) # (B, L)
 
 def kl_full_distribution(log_probs_policy: torch.Tensor,
                                log_probs_ref: torch.Tensor) -> torch.Tensor:
-    probs_policy = log_probs_policy.exp()
+    # probs_policy = log_probs_policy.exp()
 
     # kl_div returns shape (B, L, V) when reduction='none'
     kl_per_vocab = F.kl_div(
         input=log_probs_ref, # log q
-        target=probs_policy, # p
+        target=log_probs_policy, # p
         reduction='none',
-        log_target=False
+        log_target=True
     )
-    return kl_per_vocab.sum(dim=-1)  # (B, L)
+    return kl_per_vocab.sum(dim=-1) # (B, L)
