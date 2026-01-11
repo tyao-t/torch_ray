@@ -123,7 +123,7 @@ class BatchingKvCache(KvCache):
             elif isinstance(mask, torch.Tensor):
                 masks[b, :, max_seq_len - seq_len : max_seq_len] = mask
 
-        return keys, values, offsets, masks.reshape(batch_size, 1, query_mask_len, max_seq_len) # or expand, view might be ok?
+        return keys, values, offsets, masks.reshape(batch_size, 1, query_mask_len, max_seq_len) # or expand/view might be ok?
 
     def add_request(self, prefilled_kv_cache: KvCache, id: int):
         assert id < self.max_active_requests

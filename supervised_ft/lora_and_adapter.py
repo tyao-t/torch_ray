@@ -49,7 +49,7 @@ class AdapterLayer(nn.Module):
             nn.init.kaiming_uniform_(self.down_proj.weight, a=torch.sqrt(torch.Tensor(5)))
             nn.init.zeros_(self.down_proj.bias)
 
-            if up_init == "zero": #  up_proj weights/biases are exactly 0, Pfeiffer-style "no-op" at start
+            if up_init == "zero": # up_proj weights/biases are exactly 0, Pfeiffer-style "no-op" at start
                 nn.init.zeros_(self.up_proj.weight)
                 nn.init.zeros_(self.up_proj.bias)
             elif up_init == "normal": # up_proj weights ~ N(0, init_scale) so the adapter starts near-no-op but not exactly
