@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-def compute_positional_params(head_dim, theta_base=10000, context_len=2048, dtype=torch.float32):
+def compute_positional_params(head_dim, theta_base=10000, context_len=2048, dtype=torch.float32, freq_config=None):
     assert head_dim % 2 == 0,  "head_dim must be even"
     half_dim = head_dim // 2
 
@@ -9,6 +9,17 @@ def compute_positional_params(head_dim, theta_base=10000, context_len=2048, dtyp
     inv_freqs = torch.pow(theta_base, -inner)
     positions = torch.arange(context_len, dtype=dtype)
     angles = torch.outer(positions, inv_freqs)
+
+    if freq_config is not None:
+        min_turns = freq_config["low_freq_factor"]
+        max_turns = freq_config["high_freq_factor"]
+        rotations = angles * freq_config["original_context_length"] / (2 * torch.pi)
+        angles_new = torch.where(rotations < min_turns, angles / freq_config["factor"], angles)
+        smooth_factor = (rotations - min_turns) / (max_turns - min_turns)
+        angles_smoothed = (1 - smooth_factor) * (angles / freq_config["factor"]) + smooth_factor * angles
+        is_medium_freq = (rotations >= min_turns) & (rotations <= max_turns)
+        angles_new = torch.where(is_medium_freq, angles_smoothed, angles_new)
+        angles = angles_new
 
     return torch.cos(angles), torch.sin(angles)
 
