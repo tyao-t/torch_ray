@@ -16,6 +16,7 @@ class Qwen3Model(torch.nn.Module):
         self.final_norm = RMSNorm(cfg["emb_dim"])
         self.out_head = nn.Linear(cfg["emb_dim"], cfg["vocab_size"], bias=False, dtype=cfg["dtype"])
 
+        self.out_head.weight = self.tok_emb.weight # Apply weight tying
         cos, sin = compute_positional_params(
             head_dim=cfg["head_dim"],
             theta_base=cfg["rope_base"],
