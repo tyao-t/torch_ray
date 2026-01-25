@@ -19,7 +19,7 @@ class Qwen23FeedForward(nn.Module):
         super().__init__()
         self.up_proj = nn.Linear(cfg["emb_dim"], cfg["hidden_dim"]*2, dtype=cfg["dtype"], bias=False)
         self.down_proj = nn.Linear(cfg["hidden_dim"], cfg["emb_dim"], dtype=cfg["dtype"], bias=False)
-        self.beta = nn.Parameter(torch.ones(1, dtype=cfg["dtype"]))
+        self.beta = nn.Parameter(torch.ones(cfg["hidden_dim"], dtype=cfg["dtype"]))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         candidate, gate_input = self.up_proj(x).chunk(2, dim=-1)
